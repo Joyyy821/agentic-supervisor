@@ -851,6 +851,16 @@ def _event_summary(method: str, params: dict[str, Any]) -> tuple[dict[str, Any],
     return summary, native_id
 
 
+def _record_goal_limited(store: Store, run_id: str, row: Any, status: str) -> None:
+    """Persist a goal limit once, while keeping repeated reconciliation idempotent."""
+    target = "paused" if status == "budgetLimited" else "blocked"
+    error = f"Codex goal status: {status}"
+    if row["status"] == target and row["desired_status"] == target and row["last_error"] == error:
+        return
+    store.update_run(run_id, status=target, desired_status=target, last_error=error)
+    store.add_event(run_id, "supervisor/goal_limited", {"goal_status": status})
+
+
 async def run_worker(root: Path, run_id: str) -> None:
     runtime = Runtime(root)
     deadline = time.monotonic() + 10
@@ -1092,10 +1102,7 @@ async def run_worker(root: Path, run_id: str) -> None:
                                     if final_status in {"complete", "validation_failed"}:
                                         return
                         elif status in {"usageLimited", "budgetLimited", "blocked"} and row["status"] not in {"complete", "stopped"}:
-                            store.update_run(run_id, status="paused" if status == "budgetLimited" else "blocked",
-                                             desired_status="paused" if status == "budgetLimited" else "blocked",
-                                             last_error=f"Codex goal status: {status}")
-                            store.add_event(run_id, "supervisor/goal_limited", {"goal_status": status})
+                            _record_goal_limited(store, run_id, row, status)
                     except CodexError as exc:
                         store.add_event(run_id, "supervisor/goal_status_error", {"error": str(exc)})
 

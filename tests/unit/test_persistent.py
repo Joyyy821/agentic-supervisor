@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from agentic_supervisor.codex import RpcClient, VALIDATED_VERSIONS
 from agentic_supervisor.config import ConfigError, load_config
-from agentic_supervisor.runtime import Runtime, config_from_snapshot
+from agentic_supervisor.runtime import Runtime, _record_goal_limited, config_from_snapshot
 from tests.unit.helpers import new_git_repo, test_root
 import uuid
 
@@ -61,6 +61,17 @@ class PersistentTests(unittest.TestCase):
         with self.assertRaises(Exception): self.rt.submit(self.run,'resume')
         self.rt.store.extend_budget(self.run,50,0)
         self.rt.submit(self.run,'resume')
+
+    def test_repeated_native_goal_limit_poll_is_idempotent(self):
+        for _ in range(3):
+            row=self.rt.store.get_run(self.run)
+            _record_goal_limited(self.rt.store,self.run,row,'budgetLimited')
+        events=[event for event in self.rt.store.events(self.run)
+                if event['kind']=='supervisor/goal_limited']
+        row=self.rt.store.get_run(self.run)
+        self.assertEqual(len(events),1)
+        self.assertEqual((row['status'],row['desired_status'],row['last_error']),
+                         ('paused','paused','Codex goal status: budgetLimited'))
 
     def test_external_artifacts_and_snapshot(self):
         artifact=self.root/'reports';artifact.mkdir()
