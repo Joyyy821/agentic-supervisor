@@ -1,41 +1,29 @@
 # Architecture
 
-M0 uses Codex as the agent runtime and keeps the supervisor small. Codex owns the conversation, tools, thread history, and goal continuation. The supervisor owns a run's configuration snapshot, bounded controls, lifecycle, operational events, check attempts, and recovery decisions.
+Agentic Supervisor is a general-purpose process and workflow layer around native Codex. Codex owns reasoning, tools, conversation history, compaction and autonomous goal continuation. The supervisor owns durable operator controls, process ownership, provenance, execution budgets and conservative recovery. There is no separate conversation manager or required project adapter.
 
-## Components
+## Runtime and compatibility
 
-- **CLI:** validates configuration and submits durable operator requests.
-- **SQLite store:** records runs, control requests, normalized Codex events, and command attempts.
-- **Codex App Server:** owns native Codex threads and serves clients through a private Unix socket.
-- **Supervisor worker:** maintains a protocol subscription, processes queued controls, records events, and enforces elapsed-time budgets.
-- **Native Codex TUI:** runs in the same owned tmux session. It is the user interface for conversation, approvals, and interactive goal changes.
-- **tmux:** detaches the run from the SSH/VS Code client and provides the reconnectable TUI.
+One runtime root holds one live project run, its private Codex home, SQLite state, Unix sockets, logs and per-run artifacts. App Server, the Python worker and the native remote TUI occupy owned tmux windows. The worker and TUI connect to the same thread through Unix WebSockets; no TCP listener is exposed. tmux provides client-disconnect independence, not reboot autostart.
 
-Each supervisor instance has one live run at a time. A runtime directory contains `state.sqlite3`, `codex-home/`, `sockets/`, `logs/`, and `runs/<run-id>/`. Runtime paths are configured independently from the target checkout. Directory and credential permissions are owner-only.
+The explicit validated release list is 0.144.4 and 0.166.0. Unknown releases fail the version gate. Startup also probes authenticated model discovery, two clients and shared paused goal state without a model turn. Each run records the resolved executable and version; recovery uses that executable and checks that its version has not changed.
 
-The worker and TUI use separate App Server WebSocket connections over a private Unix socket. Both use the same thread and goal store. The worker uses a small standard-library RFC 6455 client because the installed `codex app-server proxy --sock` sends raw JSONL to a listener that requires a WebSocket upgrade. The proxy therefore cannot bridge this installed transport. Multi-client goal state is verified by a bounded contract test. The authenticated M0 smoke test verified that a turn started by the worker surfaces its approval request in the native TUI and continues on the same thread after a human approves it. Codex auto-review is an optional private-home setting, not supervisor control-plane logic; the M0 smoke did not exercise the reviewer path.
+For 0.166.0, thread resume requests exclude full history and retrieve a bounded page of recent turn summaries through `thread/turns/list`. Full history remains native. Goal mutations distinguish explicit operator authorization from automatic lifecycle actions. The code does not infer token-counter resets from objective changes: it reads the acknowledged native baseline and calibrates the remaining native limit.
 
-## State and recovery
+## Persistent project lifecycle
 
-Run state distinguishes requested `desired_status` from observed `status`; a CLI request is not considered applied until its effect is confirmed. Each control request receives a UUID and moves through `queued`, `dispatched`, and a confirmed or `outcome_unknown` result. Controls are not automatically resent after an ambiguous disconnect.
+The project objective is stable across milestones. Initial instructions and an optional full task file enter the native thread. The current native goal describes the current milestone. When that goal completes and the turn ends, the worker runs configured checks once for that milestone generation, records result hashes and pauses for review. It retains the same thread, worker and TUI. A human assigns the next milestone and resumes; no new agent identity is created.
 
-Codex history remains canonical. SQLite stores thread/turn/item IDs, selected event fields, timestamps, and summaries sufficient for status and recovery. Event IDs deduplicate replayed notifications. Gaps are reported; the supervisor does not claim to reconstruct every streamed token.
+Without a milestone, original one-task terminal completion behavior remains supported. `stop` is terminal; confirmed pause is the normal overnight/review state. Reports and concise decision records complement native history when context compacts.
 
-Checks and configured operations receive an attempt record before dispatch. A restart with an unresolved attempt requires evidence and an explicit operator resolution. Worker recovery reattaches to the same App Server and thread; App Server recovery restarts only the owned server process, then verifies the stored thread before continuing. Both paths mark dispatched controls and in-flight check attempts as uncertain and never replay them. At turn boundaries, the worker records the Git revision, changed paths, and a streamed hash of tracked diffs; native history remains the source for conversation details.
+SQLite distinguishes desired state from observed state. Controls are recorded before dispatch and become accepted/confirmed or uncertain. Queued input is delivered in order at the next eligible turn, including an explicitly resumed turn. A lost acknowledgement never causes blind replay.
 
-## Protocol and permissions
+Budgets are cumulative token and active-time ceilings with explicit additive extensions. Stage baselines provide current-stage usage without clearing total usage. Confirmed pauses stop active-time accounting; worker downtime while active is counted. Budget changes and milestone assignments are atomic ledger events and require a paused run with no unresolved operations.
 
-The App Server protocol is versioned and experimental. The runtime currently accepts only the observed `codex-cli 0.144.4` and makes a no-turn probe of two clients, thread creation, goal control, and shared goal reads before starting a run. The separate contract test exercises those calls. This is a narrow compatibility gate, not complete protocol-schema validation; re-audit and rerun native tests before accepting another Codex version.
+## Permissions and evidence
 
-Threads start with workspace-write sandboxing and an on-request approval policy. The target repository and configured artifacts are explicit. No TCP listener, unrestricted execution mode, or automatic approval is enabled. App Server's `command/exec` interface runs named configured checks with argument arrays and timeouts.
+Sandbox, approval policy, reviewer, model and reasoning effort are configurable. Workspace-write includes the target checkout, run artifacts and narrow explicit external artifact directories. External artifact roots cannot contain private runtime state. Native auto-review is optional and does not remove sandbox restrictions. The supervisor never grants approvals itself.
 
-## Data flow
+Checks use argument arrays, native sandboxed `command/exec`, finite timeouts and attempt records written before dispatch. Git checkpoints record HEAD, changed paths and a streamed tracked-diff hash; they do not automatically commit application code. Project workflows remain responsible for durable source commits and experiment records.
 
-1. Validate the repository, configuration, runtime root, and installed capabilities.
-2. Persist the run and its configuration/provenance snapshot.
-3. Start the owned App Server, create and record a thread, and attach the worker and native TUI.
-4. Set the native goal and submit the initial objective only after startup reconciliation succeeds.
-5. Persist controls before sending them. Record native events as they arrive and reconcile them after disconnects.
-6. On goal completion, run configured checks once and store results and artifact hashes.
-
-The optional Agentic MAPF application can configure existing project commands without introducing Isaac Sim or ROS dependencies in this repository.
+Worker recovery reconciles the same thread. Server recovery also marks observed unfinished command/file/tool effects uncertain. Resolving a ledger record requires evidence and does not retry it. Native event IDs deduplicate canonical events; transient output gaps are reported. Arbitrary external process completion and exactly-once effects cannot be reconstructed from a resumed conversation alone.

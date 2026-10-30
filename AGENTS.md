@@ -4,7 +4,7 @@
 
 Agentic Supervisor is a standalone, general-purpose Codex lifecycle and workflow tool. Core code may depend on Python's standard library, Codex CLI/App Server, and tmux. It must not require or import any target project's libraries. Keep project objectives, checks, paths, and environment settings in user configuration.
 
-M0 tracked changes belong only in this repository. Put runtime state, logs, credentials, temporary repositories, protocol schemas, and test outputs beneath a dedicated runtime root such as `/data/yangjiao/agentic-supervisor/`, or beneath ignored `.runtime/`. Never write to another target repository during M0 tests. Never commit generated runtime data, credentials, experiment output, or large artifacts.
+Supervisor tracked changes belong only in this repository. Put runtime state, logs, credentials, temporary repositories, protocol schemas, and test outputs beneath a dedicated runtime root such as `/data/yangjiao/agentic-supervisor/`, or beneath ignored `.runtime/`. Never write to another target repository during M0 tests. Never commit generated runtime data, credentials, experiment output, or large artifacts.
 
 Agentic MAPF is one optional application. Keep its assumptions and `AMAPF-M*` milestones in `docs/applications/`; do not add robotics concepts to core modules or required dependencies.
 
@@ -20,7 +20,7 @@ Agentic MAPF is one optional application. Keep its assumptions and `AMAPF-M*` mi
 
 ## Safety and reproducibility
 
-- Do not use unrestricted Codex execution or automatically approve commands. Keep approval decisions in the native TUI.
+- Never use unrestricted execution or unconditional approval. Use native human review or explicitly configured Codex auto-review while retaining sandbox boundaries. The supervisor must not answer approval requests itself.
 - Keep credentials in a private runtime Codex home, outside model-writable output folders. Do not log or snapshot secret values.
 - Keep runtime environment files and logs private. Avoid command-line arguments for secret values; use only explicitly allowlisted environment variables.
 - Bind App Server only to a private Unix socket. Do not expose unauthenticated TCP or publish credentials through a service.
@@ -32,3 +32,5 @@ Agentic MAPF is one optional application. Keep its assumptions and `AMAPF-M*` mi
 ## Validation
 
 Run unit tests with `python3 -m unittest discover -s tests/unit -v`. Put live-runtime tests behind an explicit opt-in and use a newly initialized nonrobotics repository. Store all generated test data under a unique directory inside the configured runtime test root. Verify that `mas-vln` remains unchanged.
+
+Persistent project changes must preserve thread identity, cumulative accounting, uncertain-operation guards, and paused review states. Validate exact Codex releases before extending the version allowlist. Keep runtime credentials outside external artifact roots.

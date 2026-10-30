@@ -1,3 +1,5 @@
+> Historical M0 evidence for Codex 0.144.4. See [the 0.166.0 upgrade verification](upgrade-verification.md) for the current validated runtime and persistent-project behavior.
+
 # M0 live verification
 
 Date: 2026-10-29

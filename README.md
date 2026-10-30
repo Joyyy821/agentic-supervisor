@@ -10,7 +10,7 @@ The core has no robotics, Isaac Sim, ROS, GPU, or target-project dependencies. I
 - A Codex account signed in through the supervisor's private Codex home.
 - SSH access for reconnecting to a remote host.
 
-The M0 runtime uses Codex App Server's Unix socket and native TUI. App Server is experimental and its protocol can change between Codex releases. This implementation currently accepts only the audited `codex-cli 0.144.4`; `doctor` and `start` reject other versions until the protocol is re-audited and tested. It does not install a system service or configure server boot-time startup.
+The M0 runtime uses Codex App Server's Unix socket and native TUI. App Server is experimental and its protocol can change between Codex releases. Validated releases are `codex-cli 0.144.4` and `codex-cli 0.166.0`. Other releases are rejected until audited and tested. Pin `codex_executable` in project configuration, use the global `--codex PATH` option, or set `AGENTIC_SUPERVISOR_CODEX`; the resolved executable and version are saved with each run. It does not install a system service or configure server boot-time startup.
 
 ## Install and authenticate
 
@@ -58,7 +58,12 @@ Copy `examples/generic-project.json` and set the repository, objective, and runt
   "version": 1,
   "project": "my-project",
   "repository": "/path/to/my-project",
-  "objective": "Fix the parser bug and run the project's test suite.",
+  "objective": "Maintain and improve this project.",
+  "milestone": {"name": "audit", "objective": "Inspect the parser and propose a fix; await review before implementation."},
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "high",
+  "approvals_reviewer": "auto_review",
+  "sandbox_mode": "workspace-write",
   "context_files": [],
   "token_budget": 100000,
   "time_budget_seconds": 7200,
@@ -69,6 +74,7 @@ Copy `examples/generic-project.json` and set the repository, objective, and runt
 Start the autonomous run and attach to its native Codex TUI:
 
 ```sh
+agentic-supervisor doctor --config ./my-project.json
 agentic-supervisor start ./my-project.json
 agentic-supervisor list
 agentic-supervisor attach RUN_ID
@@ -89,15 +95,29 @@ agentic-supervisor interrupt RUN_ID
 agentic-supervisor stop RUN_ID
 ```
 
-`send` steers an active turn and starts a follow-up when the run is idle. `--queue` persists input for the next available turn. Input sent while paused waits until an explicit resume. `pause` pauses the native goal and interrupts the current turn. `interrupt` cancels the turn but does not promise that the goal remains paused. The supervisor does not implement an approval responder. Codex can route eligible `on-request` prompts through `approvals_reviewer = "auto_review"` in its private `CODEX_HOME/config.toml`; the sandbox still applies. Otherwise, attach to the native TUI to review and answer prompts. M0 verified the human TUI route; it did not exercise the auto-review route.
+`send` steers an active turn and starts a follow-up when the run is idle. `--queue` persists input for the next available turn. Input sent while paused waits until an explicit resume. `pause` pauses the native goal and interrupts the current turn. `interrupt` cancels the turn but does not promise that the goal remains paused. The supervisor does not implement an approval responder. Set `approvals_reviewer: "auto_review"` in project JSON to route eligible `on-request` prompts through native Codex automatic review; the sandbox still applies. Otherwise, attach to the native TUI to review and answer prompts. The 0.166.0 upgrade test verified automatic review of a scoped file write. Reviewers can deny requests; this is not unconditional approval.
 
 Resolve uncertain outcomes with evidence after the supervisor has marked them `outcome_unknown`. For example, use `agentic-supervisor resolve RUN_ID ATTEMPT_ID --type attempt --outcome succeeded --evidence "verified result file and exit record"` for a command, or `agentic-supervisor resolve RUN_ID CONTROL_ID --type control --outcome not_applied --evidence "confirmed no request reached Codex"` for a control. Resolution updates the ledger only; it does not retry the operation.
 
 ## Configuration and checks
 
-Configuration paths are resolved relative to the JSON file. See the example for optional model, reasoning effort, environment-variable allowlist, writable artifact paths, and named validation commands. Checks use argument arrays, run through Codex's sandboxed command interface, and record their exit status and declared result files. Core code treats result JSON as opaque and makes no domain-specific assumptions.
+Repository/runtime/executable/task/artifact paths are relative to the JSON file; context files, check working directories and relative check results are relative to the target repository. See the example for optional model, reasoning effort, environment-variable allowlist, writable artifact paths, and named validation commands. Checks use argument arrays, run through Codex's sandboxed command interface, and record their exit status and declared result files. Core code treats result JSON as opaque and makes no domain-specific assumptions.
 
-The target repository is writable only under Codex's configured sandbox and approval policy. Do not disable the sandbox or automatically accept approval requests. Avoid running concurrent supervisor instances against the same checkout.
+The target repository is writable only under Codex's configured sandbox and approval policy. Keep the sandbox enabled and use either native human review or configured Codex auto-review. Avoid running concurrent supervisor instances against the same checkout.
+
+## Persistent projects and budgets
+
+A `milestone` object enables a persistent project. The overarching `objective` remains in thread context while the native goal tracks the current milestone. Completion runs checks and pauses for human review, retaining the same thread, worker and TUI. Configurations without a milestone retain one-task completion behavior.
+
+```sh
+agentic-supervisor budget RUN_ID --add-tokens 80000 --add-seconds 7200
+agentic-supervisor milestone RUN_ID implementation --objective "Implement the reviewed design and run its acceptance checks."
+agentic-supervisor resume RUN_ID
+```
+
+These changes require a confirmed paused run. Budget extensions are explicit, additive, and recorded; they never reset cumulative usage. Status reports cumulative and current-milestone usage. Time limits count active execution, including worker downtime while active; review pauses do not consume time. Resolve uncertain operations before resuming. Use `pause` for overnight breaks; `stop` ends the run.
+
+`initial_task_file` supplies a complete initial task (UTF-8, at most 128 KiB) alongside the overarching objective. `artifact_paths` grants narrow external directories through native writable roots. Create those directories first and keep them separate from the private runtime/credentials. `writable_paths` remains restricted to paths inside the checkout. The default sandbox is `workspace-write`; `read-only` is optional. Select an available model and reasoning effort using `doctor --config` before launch; the detached runtime does not inherit the VS Code model selection.
 
 ## Runtime data and recovery
 
