@@ -70,7 +70,7 @@ agentic-supervisor stop RUN_ID
 - The disconnect test exercised tmux client detachment/reconnection, not closing the user's entire VS Code SSH connection. The approval was pending during detachment, so the agent correctly waited until a human reconnected and approved; it then continued and completed on the same thread.
 - No reboot autostart is configured. A host reboot, expired authentication, account limit, or unanswered approval can stop unattended progress.
 - The live restart had no uncertain external operation in flight. The conservative `outcome_unknown` behavior is covered by controlled recovery/store tests, but arbitrary external effects still require evidence and explicit resolution.
-- App Server remains experimental and this build accepts only the audited Codex `0.144.4`. Newer Codex documents an “Approve for me” auto-review profile, but it is absent from this installed CLI and is not configured by the supervisor. Re-audit the protocol before upgrading or adding that mode.
+- App Server remains experimental and this build accepts only the audited Codex `0.144.4`. That build accepts `approvals_reviewer = "auto_review"` in `CODEX_HOME/config.toml`, but M0 verified only the human TUI approval route; it did not behaviorally test auto-review. The supervisor does not provide a per-run reviewer field. Re-audit the protocol before upgrading Codex.
 - The final smoke run's configured token limit was 12,000 and elapsed limit was 600 seconds; token budgets are operational limits, not exact billing caps.
 
 No files in `mas-vln` or pre-existing experiment storage were modified. The only tracked changes for M0 remain in `agentic-supervisor`.

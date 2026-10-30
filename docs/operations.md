@@ -51,7 +51,7 @@ Use `status`, `events RUN_ID --follow`, and `list` for operational state. Steer 
 
 `pause` is a cancellation and checkpoint request, not OS process suspension or rollback. Confirm its observed state with `status`; a separate command already launched outside Codex may need operator inspection. `stop` shuts down only this run's owned processes and keeps its database and artifacts for review.
 
-On the audited Codex 0.144.4 runtime, approval requests are reviewed by the human in the native TUI. The supervisor does not expose an automatic reviewer setting. Newer Codex releases document an [“Approve for me” auto-review profile](https://learn.chatgpt.com/docs/sandboxing), but enabling it requires a Codex upgrade and protocol re-audit; do not replace this with `never` or unrestricted sandboxing.
+The supervisor keeps `approval_policy = "on-request"` and a sandbox policy for each run; it does not expose a per-run reviewer field. Codex 0.144.4 accepts `approvals_reviewer = "auto_review"` in the private Codex home `config.toml`. This routes eligible on-request prompts through automatic review while retaining `sandbox_mode = "workspace-write"`; the setting is shared by runs using that Codex home. The M0 live test verified the human TUI route, not auto-review behavior. Recheck the setting after a Codex upgrade, and do not replace it with `approval_policy = "never"` or unrestricted sandboxing. See the [Codex approval profiles](https://learn.chatgpt.com/docs/sandboxing).
 
 ## Failures and data
 
