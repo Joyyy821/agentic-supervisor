@@ -6,11 +6,38 @@ Install Python 3.10+, Codex CLI, and tmux. Choose a private runtime root outside
 
 The current M0 deployment uses tmux and does not install user services or modify system lingering. Runs survive terminal/SSH disconnection, not reboot or host failure.
 
-## Start and reconnect
+## Start, attach, and reconnect
 
-Create a JSON config with a repository, objective, optional context files, budgets, approved environment-variable names, writable artifact paths, and named checks. Start it with `agentic-supervisor start CONFIG`. The command reports the run ID. Use `agentic-supervisor attach RUN_ID` to open the persistent native TUI; detach using tmux's detach shortcut and reconnect with the same command.
+Create a JSON config with a repository, objective, optional context files, budgets, approved environment-variable names, writable artifact paths, and named checks. From the supervisor checkout, activate the isolated environment and select a private runtime root:
 
-Use `status`, `events --follow`, and `list` for operational state. The native TUI remains the place to answer Codex approval prompts and discuss the ongoing task.
+```sh
+cd /path/to/agentic-supervisor
+source .runtime/agentic-supervisor/bin/activate
+export AGENTIC_SUPERVISOR_HOME=/data/yangjiao/agentic-supervisor
+agentic-supervisor doctor
+agentic-supervisor start /path/to/project-config.json
+agentic-supervisor list
+```
+
+Copy the run ID printed by `start` or `list`. Attach to its native Codex TUI:
+
+```sh
+TERM=screen-256color agentic-supervisor attach RUN_ID
+```
+
+The TUI, App Server, and supervisor worker run in an Agentic Supervisor-owned tmux session. Detach with `Ctrl-b`, then `d`; this closes only the terminal client. Closing SSH also disconnects the tmux client, while the owned run keeps running. After reconnecting, restore the same environment and attach to the same run ID:
+
+```sh
+cd /path/to/agentic-supervisor
+source .runtime/agentic-supervisor/bin/activate
+export AGENTIC_SUPERVISOR_HOME=/data/yangjiao/agentic-supervisor
+agentic-supervisor status RUN_ID
+TERM=screen-256color agentic-supervisor attach RUN_ID
+```
+
+Do not run `stop` when you only intend to disconnect. The runtime survives terminal and SSH loss but does not start automatically after a host reboot.
+
+Use `status`, `events RUN_ID --follow`, and `list` for operational state. Steer the existing agent from another shell with `agentic-supervisor send RUN_ID "instruction"`; it writes to the active turn when possible and otherwise records a follow-up or queued instruction. The native TUI remains the place to review and answer Codex approval prompts and to use native goal controls.
 
 ## Controls
 
@@ -21,6 +48,10 @@ Use `status`, `events --follow`, and `list` for operational state. The native TU
 - `stop` pauses and shuts down only the process group/session recorded for that run.
 - `recover` reconciles the owned tmux panes, App Server thread, event history, and pending controls before continuing.
 - Once a restart has marked an outcome `outcome_unknown`, `resolve RUN ATTEMPT --type attempt --outcome succeeded|failed|not_run --evidence TEXT` records command evidence. For an uncertain control, use `--type control --outcome accepted|rejected|not_applied`. Resolution updates the ledger only and never retries the operation.
+
+`pause` is a cancellation and checkpoint request, not OS process suspension or rollback. Confirm its observed state with `status`; a separate command already launched outside Codex may need operator inspection. `stop` shuts down only this run's owned processes and keeps its database and artifacts for review.
+
+On the audited Codex 0.144.4 runtime, approval requests are reviewed by the human in the native TUI. The supervisor does not expose an automatic reviewer setting. Newer Codex releases document an [“Approve for me” auto-review profile](https://learn.chatgpt.com/docs/sandboxing), but enabling it requires a Codex upgrade and protocol re-audit; do not replace this with `never` or unrestricted sandboxing.
 
 ## Failures and data
 

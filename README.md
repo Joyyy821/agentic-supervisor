@@ -17,21 +17,21 @@ The M0 runtime uses Codex App Server's Unix socket and native TUI. App Server is
 From this repository, create an isolated Python environment and install the package:
 
 ```sh
-python3 -m venv .runtime/venv
-source .runtime/venv/bin/activate
+python3 -m venv .runtime/agentic-supervisor
+source .runtime/agentic-supervisor/bin/activate
 python -m pip install --no-build-isolation --no-deps -e .
 ```
 
-Some shared Ubuntu hosts do not include `ensurepip` or the `python3-venv` package, and users cannot install that system package without an administrator. On those hosts, install the `virtualenv` environment builder into your user account, then keep the supervisor itself inside `.runtime/venv`:
+Some shared Ubuntu hosts do not include `ensurepip` or the `python3-venv` package, and users cannot install that system package without an administrator. On those hosts, install the `virtualenv` environment builder into your user account, then keep the supervisor itself inside `.runtime/agentic-supervisor`:
 
 ```sh
 python3 -m pip install --user virtualenv
-python3 -m virtualenv --python "$(command -v python3)" .runtime/venv
-source .runtime/venv/bin/activate
+python3 -m virtualenv --python "$(command -v python3)" .runtime/agentic-supervisor
+source .runtime/agentic-supervisor/bin/activate
 python -m pip install --no-build-isolation --no-deps -e .
 ```
 
-This does not require `sudo` or add the supervisor package to the system Python. The `virtualenv` bootstrap utility is installed only for your account; the supervisor package and its command are isolated in `.runtime/venv`. See the [`virtualenv` installation guide](https://virtualenv.pypa.io/en/stable/how-to/install.html) for other bootstrap options.
+This does not require `sudo` or add the supervisor package to the system Python. The `virtualenv` bootstrap utility is installed only for your account; the supervisor package and its command are isolated in `.runtime/agentic-supervisor`. See the [`virtualenv` installation guide](https://virtualenv.pypa.io/en/stable/how-to/install.html) for other bootstrap options.
 
 Use a private runtime root for state, Codex credentials, logs, and run artifacts. On this server, a suitable location is `/data/yangjiao/agentic-supervisor`; set `AGENTIC_SUPERVISOR_HOME` to that path. The runtime root is created with owner-only permissions. It is separate from the target project checkout.
 
@@ -89,7 +89,7 @@ agentic-supervisor interrupt RUN_ID
 agentic-supervisor stop RUN_ID
 ```
 
-`send` steers an active turn and starts a follow-up when the run is idle. `--queue` persists input for the next available turn. Input sent while paused waits until an explicit resume. `pause` pauses the native goal and interrupts the current turn. `interrupt` cancels the turn but does not promise that the goal remains paused. Use the native TUI for Codex approvals and its native goal controls. Approval routing for turns initiated by the supervisor worker still needs an authenticated native interaction test; M0 does not claim unattended approvals are verified.
+`send` steers an active turn and starts a follow-up when the run is idle. `--queue` persists input for the next available turn. Input sent while paused waits until an explicit resume. `pause` pauses the native goal and interrupts the current turn. `interrupt` cancels the turn but does not promise that the goal remains paused. Use the native TUI for Codex approvals and its native goal controls. The worker does not approve requests: attach to the TUI to review and answer them. Approval prompts were observed in the authenticated M0 interaction test; unattended approval handling is not supported.
 
 Resolve uncertain outcomes with evidence after the supervisor has marked them `outcome_unknown`. For example, use `agentic-supervisor resolve RUN_ID ATTEMPT_ID --type attempt --outcome succeeded --evidence "verified result file and exit record"` for a command, or `agentic-supervisor resolve RUN_ID CONTROL_ID --type control --outcome not_applied --evidence "confirmed no request reached Codex"` for a control. Resolution updates the ledger only; it does not retry the operation.
 
