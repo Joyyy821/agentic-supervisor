@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "project": "example-project",
+  "repository": "/path/to/a/git/repository",
+  "objective": "Inspect the project, implement the requested change, and run its tests.",
+  "context_files": [],
+  "model": null,
+  "reasoning_effort": null,
+  "approval_policy": "on-request",
+  "token_budget": 100000,
+  "time_budget_seconds": 7200,
+  "environment_allowlist": [],
+  "writable_paths": [],
+  "checks": []
+}
