@@ -6,10 +6,26 @@ import struct
 import unittest
 from pathlib import Path
 
-from agentic_supervisor.codex import RpcClient
+from agentic_supervisor.codex import CodexError, RpcClient
 
 
 class RpcTests(unittest.TestCase):
+    def test_rpc_errors_include_server_message(self) -> None:
+        async def scenario():
+            client = RpcClient("codex", Path("/unused.sock"), Path("/unused"))
+
+            async def reject(request):
+                client._pending[request["id"]].set_result({
+                    "id": request["id"],
+                    "error": {"code": -32600, "message": "no rollout found"},
+                })
+
+            client._write = reject
+            with self.assertRaisesRegex(CodexError, "thread/resume failed \\(-32600\\): no rollout found"):
+                await client.call("thread/resume", {"threadId": "missing"})
+
+        asyncio.run(scenario())
+
     def test_notification_queue_is_bounded_and_discards_transcript_content(self) -> None:
         client = RpcClient("codex", Path("/unused.sock"), Path("/unused"))
         client._queue_event({"method": "item/agentMessage/delta", "params": {

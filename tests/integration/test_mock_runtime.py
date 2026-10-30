@@ -16,13 +16,19 @@ class FakeRpc:
     def __init__(self):
         self.calls = []
         self.closed = False
+        self.turn_starts = 0
 
     async def call(self, method, params, timeout=30):
         self.calls.append((method, params))
         if method == "thread/start":
             return {"thread": {"id": "thread-fixture"}}
         if method == "turn/start":
-            return {"turn": {"id": "turn-fixture"}}
+            self.turn_starts += 1
+            return {"turn": {"id": "bootstrap-turn" if self.turn_starts == 1 else "turn-fixture"}}
+        if method == "thread/resume":
+            return {"thread": {"turns": [{"id": "bootstrap-turn", "status": "completed"}]}}
+        if method == "thread/goal/get":
+            return {"goal": {"status": "completed", "tokensUsed": 17}}
         return {}
 
     async def close(self):
@@ -41,8 +47,8 @@ class MockRuntimeTests(unittest.TestCase):
             ',"objective":"Write a plain Python greeting and test it.","token_budget":30000,"time_budget_seconds":600}',
             encoding="utf-8",
         )
-        config = load_config(config_path, root / "state")
-        runtime = Runtime(root / "state", codex="/usr/bin/true")
+        config = load_config(config_path, root / "s")
+        runtime = Runtime(root / "s", codex="/usr/bin/true")
         client1, client2 = FakeRpc(), FakeRpc()
         clients = iter([client1, client2])
 
@@ -67,9 +73,15 @@ class MockRuntimeTests(unittest.TestCase):
         self.assertEqual(row["status"], "active")
         self.assertEqual(row["thread_id"], "thread-fixture")
         self.assertEqual(row["git_head"], "deadbeef")
-        self.assertEqual([method for method, _ in client1.calls], ["thread/start"])
+        self.assertEqual(row["tokens_used"], 17)
+        self.assertEqual([method for method, _ in client1.calls], [
+            "thread/start", "thread/goal/set", "turn/start", "thread/resume",
+            "thread/goal/get", "thread/goal/set",
+        ])
+        self.assertEqual(client1.calls[1][1]["status"], "paused")
+        self.assertEqual(client1.calls[2][1]["sandboxPolicy"]["type"], "readOnly")
         self.assertEqual([method for method, _ in client2.calls], ["thread/goal/set", "turn/start"])
-        self.assertEqual(client2.calls[0][1]["tokenBudget"], 30000)
+        self.assertEqual(client2.calls[0][1]["tokenBudget"], 29983)
         self.assertEqual(client2.calls[1][1]["sandboxPolicy"]["type"], "workspaceWrite")
         self.assertIn(str(repo), client2.calls[1][1]["sandboxPolicy"]["writableRoots"])
         self.assertTrue(any("supervisor" in call.args for call in tmux.call_args_list))
@@ -77,6 +89,11 @@ class MockRuntimeTests(unittest.TestCase):
                            if "supervisor" in call.args and "worker" in str(call.args[-1]))
         self.assertIn("--runtime-root", worker_call.args[-1])
         self.assertIn("agentic_supervisor.worker", worker_call.args[-1])
+        tui_call = next(call for call in tmux.call_args_list
+                        if call.args[0] == "new-window" and call.args[4] == "codex")
+        self.assertNotIn(">>", tui_call.args[-1])
+        tui_env = runtime.root / "runs" / run_id / "tui.env"
+        self.assertIn("TERM=screen-256color", tui_env.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

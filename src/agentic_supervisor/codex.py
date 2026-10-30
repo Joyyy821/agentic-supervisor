@@ -226,7 +226,9 @@ class RpcClient:
             raise
         if "error" in response:
             error = response["error"]
-            raise CodexError(f"{method} failed ({error.get('code')})")
+            message = error.get("message")
+            detail = f": {message}" if isinstance(message, str) and message else ""
+            raise CodexError(f"{method} failed ({error.get('code')}){detail}")
         return response.get("result", {})
 
     async def notify(self, method: str, params: dict[str, Any]) -> None:

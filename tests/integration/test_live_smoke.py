@@ -27,12 +27,19 @@ class LiveSmokeTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(fixture), "-c", "user.email=test@example.invalid",
                         "-c", "user.name=Smoke Test", "commit", "-qm", "fixture"], check=True)
         runtime_root = test_root / f"r-{uuid.uuid4().hex[:8]}"
+        runtime_root.mkdir(parents=True, mode=0o700)
+        supervisor_home = Path(os.environ["AGENTIC_SUPERVISOR_HOME"]).expanduser().resolve()
+        codex_home = supervisor_home / "codex-home"
+        if not codex_home.is_dir():
+            self.fail(f"authenticated Codex home is missing: {codex_home}")
+        (runtime_root / "codex-home").symlink_to(codex_home, target_is_directory=True)
         config_path = test_root / f"live-{uuid.uuid4()}.json"
+        token_budget = int(os.environ.get("AGENTIC_SUPERVISOR_SMOKE_TOKEN_BUDGET", "30000"))
         config_path.write_text(json.dumps({
             "version": 1, "project": "python-smoke", "repository": str(fixture),
             "objective": "Create greeting.py with a main function that prints exactly hello supervisor. "
                          "Do not change README.md.",
-            "token_budget": 30000, "time_budget_seconds": 600,
+            "token_budget": token_budget, "time_budget_seconds": 600,
             "checks": [{"name": "greeting", "command": ["python3", "-c",
                         "import subprocess,sys; p=subprocess.run([sys.executable,'greeting.py'],capture_output=True,text=True); "
                         "assert p.returncode==0 and p.stdout.strip()=='hello supervisor'"], "timeout_seconds": 20}]

@@ -249,14 +249,16 @@ class Runtime:
         return self._owned_command(run_id, env, argv, log_dir / f"{run_id}-worker.log")
 
     def _tui_command(self, run_id: str, thread_id: str, config: RunConfig,
-                     socket: Path, log_dir: Path) -> str:
+                     socket: Path) -> str:
         env = _environment(config, self.codex_home)
+        env["TERM"] = "screen-256color"
         argv = [self.codex, "--cd", str(config.repository), "--remote", f"unix://{socket}", "--no-alt-screen",
                 "resume", thread_id]
-        return self._owned_command(run_id, env, argv, log_dir / f"{run_id}-tui.log")
+        return self._owned_command(run_id, env, argv, None, "tui.env")
 
-    def _owned_command(self, run_id: str, env: dict[str, str], argv: list[str], log_path: Path) -> str:
-        env_path = self.root / "runs" / run_id / "runtime.env"
+    def _owned_command(self, run_id: str, env: dict[str, str], argv: list[str],
+                       log_path: Path | None, env_name: str = "runtime.env") -> str:
+        env_path = self.root / "runs" / run_id / env_name
         env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         encoded_env = "".join(f"export {key}={shlex.quote(value)}\n" for key, value in sorted(env.items()))
         fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -266,7 +268,8 @@ class Runtime:
         command = ["/usr/bin/env", "-i", "/bin/sh", "-c",
                    'set -a; . "$1"; set +a; shift; exec "$@"',
                    "agentic-supervisor", str(env_path), *argv]
-        return "exec " + shlex.join(command) + " >>" + shlex.quote(str(log_path)) + " 2>&1"
+        redirected = f" >>{shlex.quote(str(log_path))} 2>&1" if log_path else ""
+        return "exec " + shlex.join(command) + redirected
 
     async def connect_when_ready(self, socket: Path, timeout: float = 20) -> RpcClient:
         end = time.monotonic() + timeout
@@ -304,7 +307,11 @@ class Runtime:
                 if state == "1":
                     raise RuntimeErrorMessage("native Codex TUI exited during startup")
                 if state == "0" and command == "codex":
-                    return
+                    await asyncio.sleep(0.75)
+                    stable = self.tmux("list-panes", "-t", f"{session}:codex", "-F",
+                                       "#{pane_dead}:#{pane_current_command}", check=False)
+                    if stable.returncode == 0 and stable.stdout.strip() == "0:codex":
+                        return
             await asyncio.sleep(0.2)
         raise RuntimeErrorMessage("native Codex TUI process did not remain attached before the startup deadline")
 
@@ -380,6 +387,62 @@ class Runtime:
                 if not isinstance(thread_id, str) or not thread_id:
                     raise RuntimeErrorMessage("Codex did not return a thread ID")
                 self.store.update_run(run_id, thread_id=thread_id)
+
+                # A newly started App Server thread has no persisted rollout yet, so
+                # thread/resume fails with "no rollout found" until its first turn.
+                # Establish a bounded, read-only bootstrap turn before starting the
+                # worker and native TUI; both then attach to the same persisted thread
+                # before the actual objective begins.
+                bootstrap_budget = config.token_budget
+                await client.call("thread/goal/set", {
+                    "threadId": thread_id,
+                    "objective": "Session setup only: respond READY without using tools.",
+                    "status": "paused",
+                    "tokenBudget": bootstrap_budget,
+                })
+                bootstrap = await client.call("turn/start", {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text":
+                               "Reply with exactly READY. This is a session setup turn. "
+                               "Do not use tools, access files, or change anything."}],
+                    "cwd": str(config.repository),
+                    "model": config.model,
+                    "effort": config.reasoning_effort,
+                    "sandboxPolicy": {"type": "readOnly"},
+                }, timeout=45)
+                bootstrap_turn_id = bootstrap.get("turn", {}).get("id")
+                if not isinstance(bootstrap_turn_id, str) or not bootstrap_turn_id:
+                    raise RuntimeErrorMessage("Codex did not return a session bootstrap turn ID")
+                deadline = time.monotonic() + 180
+                bootstrap_status = None
+                while time.monotonic() < deadline:
+                    resumed = await client.call("thread/resume", {
+                        "threadId": thread_id, "cwd": str(config.repository),
+                    }, timeout=15)
+                    turns = resumed.get("thread", {}).get("turns", [])
+                    turn = next((item for item in reversed(turns)
+                                 if isinstance(item, dict) and item.get("id") == bootstrap_turn_id), None)
+                    bootstrap_status = turn.get("status") if turn else None
+                    if bootstrap_status == "completed":
+                        break
+                    if bootstrap_status in {"failed", "interrupted"}:
+                        raise RuntimeErrorMessage(
+                            f"Codex session bootstrap ended as {bootstrap_status}"
+                        )
+                    await asyncio.sleep(0.5)
+                else:
+                    raise RuntimeErrorMessage("Codex session bootstrap did not finish within 180 seconds")
+
+                goal_state = await client.call("thread/goal/get", {"threadId": thread_id})
+                bootstrap_tokens = (goal_state.get("goal") or {}).get("tokensUsed", 0)
+                if isinstance(bootstrap_tokens, int) and bootstrap_tokens > 0:
+                    self.store.observe_token_usage(run_id, bootstrap_tokens)
+                await client.call("thread/goal/set", {"threadId": thread_id, "status": "paused"})
+                self.store.add_event(run_id, "supervisor/session_initialized", {
+                    "thread_id": thread_id,
+                    "bootstrap_turn_id": bootstrap_turn_id,
+                    "bootstrap_tokens": bootstrap_tokens if isinstance(bootstrap_tokens, int) else None,
+                })
             finally:
                 await client.close()
 
@@ -388,7 +451,7 @@ class Runtime:
             self.tmux("set-window-option", "-t", f"{session}:supervisor", "remain-on-exit", "on")
             await self.wait_for_worker(run_id, session)
             self.tmux("new-window", "-t", session, "-n", "codex",
-                      self._tui_command(run_id, thread_id, config, socket, log_dir))
+                      self._tui_command(run_id, thread_id, config, socket))
             self.tmux("set-window-option", "-t", f"{session}:codex", "remain-on-exit", "on")
             await self.wait_for_tui(session)
             client = await self.connect_when_ready(socket, 10)
@@ -397,11 +460,17 @@ class Runtime:
                 self.store.update_run(run_id, status="active", started_at=started_at, last_error=None)
                 self.store.add_event(run_id, "supervisor/run_started",
                                      {"thread_id": thread_id, "codex_version": version_text})
+                bootstrap_tokens = self.store.get_run(run_id)["tokens_used"]
+                remaining_token_budget = config.token_budget - bootstrap_tokens
+                if remaining_token_budget < 1:
+                    raise RuntimeErrorMessage(
+                        "session bootstrap consumed the configured token budget; increase token_budget"
+                    )
                 await client.call("thread/goal/set", {
                     "threadId": thread_id,
                     "objective": config.objective,
                     "status": "active",
-                    "tokenBudget": config.token_budget,
+                    "tokenBudget": remaining_token_budget,
                 })
                 await client.call("turn/start", {
                     "threadId": thread_id,
@@ -507,7 +576,7 @@ class Runtime:
             "uncertain_controls": interrupted["controls"],
         })
         tui = self.tmux("list-panes", "-t", f"{session}:codex", "-F", "#{pane_dead}", check=False)
-        tui_command = self._tui_command(run_id, row["thread_id"], config, socket, self.root / "logs")
+        tui_command = self._tui_command(run_id, row["thread_id"], config, socket)
         if tui.returncode:
             self.tmux("new-window", "-t", session, "-n", "codex", tui_command)
             self.tmux("set-window-option", "-t", f"{session}:codex", "remain-on-exit", "on")

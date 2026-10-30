@@ -13,7 +13,9 @@ def test_root() -> Path:
     if configured:
         root = Path(configured).expanduser().resolve()
     else:
-        root = Path(__file__).resolve().parents[2] / ".runtime" / "tests"
+        # Keep Unix socket paths below the host's sockaddr limit even when
+        # tests create nested runtime directories. .runtime is Git-ignored.
+        root = Path(__file__).resolve().parents[2] / ".runtime" / "t"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     return root
 
