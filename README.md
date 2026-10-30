@@ -21,6 +21,15 @@ python3 -m venv .runtime/venv
 .runtime/venv/bin/pip install --no-build-isolation --no-deps -e .
 ```
 
+Some shared Ubuntu hosts do not include `ensurepip` or the `python3-venv` package, and users cannot install that system package without an administrator. On those hosts, install the dependency-free CLI into your account instead:
+
+```sh
+python3 -m pip install --user --no-build-isolation --no-deps .
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+This does not require `sudo` or alter system packages. Add the `PATH` export to your shell startup file if you want it to persist across logins. Reinstall after updating the checkout so the user-level command picks up code changes.
+
 Use a private runtime root for state, Codex credentials, logs, and run artifacts. On this server, a suitable location is `/data/yangjiao/agentic-supervisor`; set `AGENTIC_SUPERVISOR_HOME` to that path. The runtime root is created with owner-only permissions. It is separate from the target project checkout.
 
 Sign in once using the private Codex home:
