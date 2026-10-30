@@ -20,6 +20,8 @@ Authenticated `model/list` includes GPT-6.1 Sol, GPT-6 Astra, GPT-6.1 Terra and 
 
 Effective settings: `approvalPolicy=on-request`, `approvalsReviewer=auto_review`, workspace-write, sandbox network access false. Project-native web research is configured as `web_search=live`. External report directories are explicit writable roots. No full-access or never-approve mode was used.
 
+The post-launch `doctor --config /data/yangjiao/agentic-mapf/agentic-mapf.json` check passed in the host runtime namespace. It attached two App Server clients to the existing run, confirmed the shared `budgetLimited` goal, and returned eight models including `gpt-6.1-sol` with High reasoning. A check from the restricted VS Code command sandbox could not reach the private Unix socket; this was a namespace limitation, not a lost agent session.
+
 The live smoke requested an explicitly authorized marker file outside its ordinary writable roots. Native events recorded `item/autoApprovalReview/started` and `/completed`, and the marker was created without a human approval response. A separate sandboxed command successfully read source and wrote an allowed report, then received EROFS when writing an ungranted sibling path. Auto-review does not remove that boundary.
 
 ## Tests and evidence
@@ -93,7 +95,7 @@ The user authorized launch after verification, and M1a was started on 2026-10-30
 - Native usage reported: 86,494 tokens against the 80,000-token limit; elapsed time reported: 50.18 seconds against 7,200 seconds. Native enforcement overshot the configured token budget by 6,494 tokens before the worker reconciled the limit.
 - The milestone remains `AMAPF-M1a` / `active`, not `review`. No requested M1a report files were present under `/data/yangjiao/agentic-mapf/m1a/` at the last check. M1a is **not complete**, and M1b has not started.
 - The saved `/data/yangjiao/agentic-mapf/launch-record.json` contains the launch settings and current observation. The supervisor runtime and Codex history must be preserved. Do not start a second run. Resuming requires an explicit budget extension because the token budget is exhausted; no extension has been made.
-- The original worker repeatedly recorded the already-known native `budgetLimited` state. A code fix makes this transition/event idempotent for a worker using the updated package. The worker in the existing live runtime was not restarted from this shell because its tmux socket is outside this execution namespace; the run remains paused, but its event ledger may contain repeated limit notices. Do not use `stop` to clear those notices, because stop would close the persistent runtime.
+- The original worker repeatedly recorded the already-known native `budgetLimited` state. A code fix makes this transition/event idempotent. A controlled restart of only the worker, followed by `recover`, preserved the same run and thread, left the goal paused, and kept the App Server/TUI panes alive. The limit-notice count stayed at 9,035 over an 8-second check after recovery. No budget extension or new Codex turn was issued.
 
 Use the existing run, never `start`, to inspect and reconnect:
 
