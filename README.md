@@ -18,17 +18,20 @@ From this repository, create an isolated Python environment and install the pack
 
 ```sh
 python3 -m venv .runtime/venv
-.runtime/venv/bin/pip install --no-build-isolation --no-deps -e .
+source .runtime/venv/bin/activate
+python -m pip install --no-build-isolation --no-deps -e .
 ```
 
-Some shared Ubuntu hosts do not include `ensurepip` or the `python3-venv` package, and users cannot install that system package without an administrator. On those hosts, install the dependency-free CLI into your account instead:
+Some shared Ubuntu hosts do not include `ensurepip` or the `python3-venv` package, and users cannot install that system package without an administrator. On those hosts, install the `virtualenv` environment builder into your user account, then keep the supervisor itself inside `.runtime/venv`:
 
 ```sh
-python3 -m pip install --user --no-build-isolation --no-deps .
-export PATH="$HOME/.local/bin:$PATH"
+python3 -m pip install --user virtualenv
+python3 -m virtualenv --python "$(command -v python3)" .runtime/venv
+source .runtime/venv/bin/activate
+python -m pip install --no-build-isolation --no-deps -e .
 ```
 
-This does not require `sudo` or alter system packages. Add the `PATH` export to your shell startup file if you want it to persist across logins. Reinstall after updating the checkout so the user-level command picks up code changes.
+This does not require `sudo` or add the supervisor package to the system Python. The `virtualenv` bootstrap utility is installed only for your account; the supervisor package and its command are isolated in `.runtime/venv`. See the [`virtualenv` installation guide](https://virtualenv.pypa.io/en/stable/how-to/install.html) for other bootstrap options.
 
 Use a private runtime root for state, Codex credentials, logs, and run artifacts. On this server, a suitable location is `/data/yangjiao/agentic-supervisor`; set `AGENTIC_SUPERVISOR_HOME` to that path. The runtime root is created with owner-only permissions. It is separate from the target project checkout.
 
