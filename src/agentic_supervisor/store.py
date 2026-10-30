@@ -86,6 +86,17 @@ class Store:
                 db.execute("ALTER TABLE runs ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0")
             if "native_tokens_seen" not in columns:
                 db.execute("ALTER TABLE runs ADD COLUMN native_tokens_seen INTEGER NOT NULL DEFAULT 0")
+            additions = {
+                "codex_executable": "TEXT", "milestone_name": "TEXT", "milestone_objective": "TEXT",
+                "milestone_status": "TEXT", "milestone_generation": "INTEGER NOT NULL DEFAULT 0",
+                "stage_token_start": "INTEGER NOT NULL DEFAULT 0", "stage_time_start": "REAL NOT NULL DEFAULT 0",
+                "elapsed_seconds": "REAL NOT NULL DEFAULT 0", "active_since": "REAL",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
+            if "active_since" not in columns:
+                db.execute("UPDATE runs SET active_since=COALESCE(started_at,created_at) WHERE status='active'")
             index = db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='one_live_run'").fetchone()
             if index and "'pausing'" not in index[0]:
                 db.execute("DROP INDEX one_live_run")
@@ -120,6 +131,9 @@ class Store:
                  config.objective, snapshot, codex_version, git_head, int(git_dirty), now,
                  config.token_budget, config.time_budget_seconds),
             )
+        if config.milestone:
+            self.update_run(run_id, milestone_name=config.milestone["name"],
+                            milestone_objective=config.milestone["objective"], milestone_status="prepared")
         run_dir = self.root / "runs" / run_id
         try:
             run_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -148,11 +162,19 @@ class Store:
             return list(db.execute("SELECT * FROM runs ORDER BY created_at DESC"))
 
     def update_run(self, run_id: str, **fields: Any) -> None:
-        allowed = {"thread_id", "status", "desired_status", "started_at", "finished_at", "last_error"}
+        allowed = {"thread_id", "status", "desired_status", "started_at", "finished_at", "last_error", "codex_executable",
+                   "milestone_name", "milestone_objective", "milestone_status", "native_tokens_seen"}
         if not fields or set(fields) - allowed:
             raise ValueError("invalid run fields")
-        assignments = ", ".join(f"{key} = ?" for key in fields)
         with self.connect() as db:
+            old = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if "status" in fields and old:
+                if fields["status"] == "active" and old["active_since"] is None:
+                    fields["active_since"] = time.time()
+                elif fields["status"] in {"paused", "blocked", "stopped", "complete", "validation_failed", "failed"} and old["active_since"] is not None:
+                    fields["elapsed_seconds"] = self.elapsed(old)
+                    fields["active_since"] = None
+            assignments = ", ".join(f"{key} = ?" for key in fields)
             db.execute(f"UPDATE runs SET {assignments} WHERE id = ?", (*fields.values(), run_id))
 
     def observe_token_usage(self, run_id: str, native_tokens: int) -> tuple[int, int]:
@@ -295,3 +317,71 @@ class Store:
     def attempts(self, run_id: str) -> list[sqlite3.Row]:
         with self.connect() as db:
             return list(db.execute("SELECT * FROM attempts WHERE run_id=? ORDER BY started_at", (run_id,)))
+
+    @staticmethod
+    def elapsed(row: Any) -> float:
+        return row["elapsed_seconds"] + (max(0, time.time() - row["active_since"])
+                                         if row["active_since"] is not None else 0)
+
+    def require_paused(self, db: sqlite3.Connection, run_id: str) -> sqlite3.Row:
+        row = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if row is None or row["status"] != "paused" or row["desired_status"] != "paused":
+            raise ValueError("operation requires a confirmed paused run")
+        if db.execute("SELECT 1 FROM controls WHERE run_id=? AND status IN ('dispatched','outcome_unknown','awaiting_ack')", (run_id,)).fetchone() or db.execute("SELECT 1 FROM attempts WHERE run_id=? AND status IN ('running','outcome_unknown')", (run_id,)).fetchone():
+            raise ValueError("resolve uncertain operations before continuing")
+        return row
+
+    def extend_budget(self, run_id: str, tokens: int, seconds: int) -> None:
+        if any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in (tokens, seconds)) or not (tokens or seconds):
+            raise ValueError("supply a positive token or time increment")
+        if tokens > 10000000 or seconds > 604800:
+            raise ValueError("single extension exceeds 10M tokens or seven days")
+        with self.connect() as db:
+            row = self.require_paused(db, run_id)
+            db.execute("UPDATE runs SET token_budget=token_budget+?, time_budget_seconds=time_budget_seconds+? WHERE id=?", (tokens, seconds, run_id))
+            payload = {"added_tokens": tokens, "added_seconds": seconds,
+                       "previous_token_budget": row["token_budget"], "previous_time_budget": row["time_budget_seconds"],
+                       "tokens_used": row["tokens_used"], "elapsed_seconds": self.elapsed(row)}
+            db.execute("INSERT INTO events(run_id,kind,payload_json,created_at) VALUES(?,?,?,?)",
+                       (run_id, "supervisor/budget_extended", json.dumps(payload), time.time()))
+
+    def set_milestone(self, run_id: str, name: str, objective: str) -> None:
+        from .config import validate_milestone
+        milestone = validate_milestone({"name": name, "objective": objective})
+        with self.connect() as db:
+            row = self.require_paused(db, run_id)
+            if row["milestone_name"] is None:
+                raise ValueError("run was not configured as a persistent milestone project")
+            db.execute("UPDATE runs SET milestone_name=?,milestone_objective=?,milestone_status='prepared',"
+                       "milestone_generation=milestone_generation+1,stage_token_start=tokens_used,stage_time_start=elapsed_seconds WHERE id=?",
+                       (milestone["name"], milestone["objective"], run_id))
+            payload = {"previous": row["milestone_name"], "milestone": milestone,
+                       "previous_stage_tokens": row["tokens_used"] - row["stage_token_start"],
+                       "previous_stage_seconds": row["elapsed_seconds"] - row["stage_time_start"]}
+            db.execute("INSERT INTO events(run_id,kind,payload_json,created_at) VALUES(?,?,?,?)",
+                       (run_id, "supervisor/milestone_assigned", json.dumps(payload), time.time()))
+
+    def has_uncertain_work(self, run_id: str) -> bool:
+        with self.connect() as db:
+            return bool(db.execute("SELECT 1 FROM controls WHERE run_id=? AND status IN ('outcome_unknown','awaiting_ack')", (run_id,)).fetchone() or
+                        db.execute("SELECT 1 FROM attempts WHERE run_id=? AND status='outcome_unknown'", (run_id,)).fetchone())
+
+    def mark_native_operations_unknown(self, run_id: str) -> int:
+        """A lost server cannot establish completion of observed side effects."""
+        count = 0
+        with self.connect() as db:
+            rows = db.execute("SELECT e.native_id,e.payload_json FROM events e WHERE e.run_id=? "
+                              "AND e.kind='item/started' AND e.native_id IS NOT NULL AND NOT EXISTS "
+                              "(SELECT 1 FROM events c WHERE c.run_id=e.run_id AND c.native_id=e.native_id "
+                              "AND c.kind='item/completed')", (run_id,)).fetchall()
+            for row in rows:
+                if json.loads(row["payload_json"]).get("type") not in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}:
+                    continue
+                name = "native:" + row["native_id"]
+                if db.execute("SELECT 1 FROM attempts WHERE run_id=? AND name=?", (run_id, name)).fetchone():
+                    continue
+                db.execute("INSERT INTO attempts(id,run_id,name,command_json,status,started_at,result_json) VALUES(?,?,?,?,?,?,?)",
+                           (str(uuid.uuid4()), run_id, name, '[]', 'outcome_unknown', time.time(),
+                            json.dumps({"evidence": "server lost before a command completion event; inspect native history and outputs"})))
+                count += 1
+        return count

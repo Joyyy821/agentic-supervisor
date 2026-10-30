@@ -41,9 +41,21 @@ class RunConfig:
     environment_allowlist: tuple[str, ...]
     writable_paths: tuple[Path, ...]
     checks: tuple[Check, ...]
+    codex_executable: str | None = None
+    approvals_reviewer: str | None = None
+    sandbox_mode: str = "workspace-write"
+    artifact_paths: tuple[Path, ...] = ()
+    milestone: dict[str, str] | None = None
+    initial_task_file: Path | None = None
 
     def safe_snapshot(self) -> dict[str, Any]:
         return {
+            "codex_executable": self.codex_executable,
+            "approvals_reviewer": self.approvals_reviewer,
+            "sandbox_mode": self.sandbox_mode,
+            "artifact_paths": [str(p) for p in self.artifact_paths],
+            "milestone": self.milestone,
+            "initial_task_file": str(self.initial_task_file) if self.initial_task_file else None,
             "version": self.version,
             "project": self.project,
             "repository": str(self.repository),
@@ -163,11 +175,52 @@ def load_config(path: str | Path, runtime_override: str | Path | None = None) ->
     reasoning = data.get("reasoning_effort")
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ConfigError("model must be null or a non-empty string")
-    if reasoning is not None and reasoning not in {"low", "medium", "high", "xhigh", "ultra"}:
+    if reasoning is not None and reasoning not in {"low", "medium", "high", "xhigh", "max", "ultra"}:
         raise ConfigError("reasoning_effort must be null, low, medium, high, xhigh, or ultra")
     approval_policy = data.get("approval_policy", "on-request")
     if approval_policy not in {"untrusted", "on-request"}:
         raise ConfigError("approval_policy must be 'untrusted' or 'on-request'")
+
+    reviewer = data.get("approvals_reviewer")
+    if reviewer not in {None, "user", "auto_review"}:
+        raise ConfigError("approvals_reviewer must be user or auto_review")
+    sandbox = data.get("sandbox_mode", "workspace-write")
+    if sandbox not in {"workspace-write", "read-only"}:
+        raise ConfigError("sandbox_mode must be workspace-write or read-only")
+    executable = data.get("codex_executable")
+    if executable is not None:
+        if not isinstance(executable, str) or not executable:
+            raise ConfigError("codex_executable must be a path")
+        ep = Path(executable).expanduser()
+        if not ep.is_absolute():
+            ep = source.parent / ep
+        executable = str(ep.resolve(strict=True))
+        if not os.access(executable, os.X_OK):
+            raise ConfigError("codex_executable must be executable")
+    milestone = validate_milestone(data.get("milestone"))
+    raw_artifacts = data.get("artifact_paths", [])
+    if not isinstance(raw_artifacts, list) or any(not isinstance(p, str) for p in raw_artifacts):
+        raise ConfigError("artifact_paths must be an array of paths")
+    artifacts = []
+    for value in raw_artifacts:
+        ap = Path(value).expanduser()
+        ap = (ap if ap.is_absolute() else source.parent / ap).resolve()
+        if (ap in {Path('/'), Path.home()} or ap == runtime_root or
+                ap in runtime_root.parents or runtime_root in ap.parents):
+            raise ConfigError("artifact paths must not expose runtime state or the home/root directory")
+        if not ap.is_dir():
+            raise ConfigError("artifact_paths directories must already exist")
+        artifacts.append(ap)
+
+    task_file = data.get("initial_task_file")
+    if task_file is not None:
+        if not isinstance(task_file, str):
+            raise ConfigError("initial_task_file must be a path")
+        tp = Path(task_file).expanduser()
+        task_file = (tp if tp.is_absolute() else source.parent / tp).resolve(strict=True)
+        if not task_file.is_file() or task_file.stat().st_size > 128 * 1024:
+            raise ConfigError("initial_task_file must be a text file of at most 128 KiB")
+        task_file.read_text(encoding="utf-8")
 
     env_names = data.get("environment_allowlist", [])
     if not isinstance(env_names, list) or any(
@@ -207,7 +260,17 @@ def load_config(path: str | Path, runtime_override: str | Path | None = None) ->
         timeout = entry.get("timeout_seconds", 900)
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 86400:
             raise ConfigError(f"check {name} timeout_seconds must be between 1 and 86400")
-        results = _path_list(entry.get("result_files", []), repository, f"check {name} result_files")
+        raw_results = entry.get("result_files", [])
+        if not isinstance(raw_results, list) or any(not isinstance(p, str) for p in raw_results):
+            raise ConfigError("result_files must be an array of paths")
+        results = []
+        for value in raw_results:
+            rp = Path(value).expanduser()
+            rp = (rp if rp.is_absolute() else repository / rp).resolve()
+            if not any(rp == root or root in rp.parents for root in (repository, *artifacts)):
+                raise ConfigError("result_files must be in the repository or configured artifact paths")
+            results.append(rp)
+        results = tuple(results)
         checks.append(Check(name, tuple(command), cwd, timeout, results))
 
     return RunConfig(
@@ -226,4 +289,18 @@ def load_config(path: str | Path, runtime_override: str | Path | None = None) ->
         environment_allowlist=tuple(env_names),
         writable_paths=writable_paths,
         checks=tuple(checks),
+        codex_executable=executable, approvals_reviewer=reviewer, sandbox_mode=sandbox,
+        artifact_paths=tuple(artifacts), milestone=milestone, initial_task_file=task_file,
     )
+
+
+def validate_milestone(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"name", "objective"}:
+        raise ConfigError("milestone must contain name and objective")
+    if not isinstance(value["name"], str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value["name"]):
+        raise ConfigError("milestone name must use letters, digits, dots, dashes or underscores")
+    if not isinstance(value["objective"], str) or not 1 <= len(value["objective"].strip()) <= 3500:
+        raise ConfigError("milestone objective must contain 1 to 3500 characters")
+    return {"name": value["name"], "objective": value["objective"].strip()}

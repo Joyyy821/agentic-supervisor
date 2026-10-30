@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 
+VALIDATED_VERSIONS = {"codex-cli 0.144.4", "codex-cli 0.166.0"}
+
+
 class CodexError(RuntimeError):
     pass
 
@@ -43,7 +46,7 @@ def _compact_event(value: Any, key: str = "", depth: int = 0) -> Any:
 
 
 def codex_executable(configured: str | None = None) -> str:
-    executable = configured or shutil.which("codex")
+    executable = configured or os.environ.get("AGENTIC_SUPERVISOR_CODEX") or shutil.which("codex")
     if not executable:
         raise CodexError("Codex CLI was not found on PATH")
     return str(Path(executable).expanduser().resolve())
@@ -62,6 +65,7 @@ class RpcClient:
     def __init__(self, executable: str, socket_path: Path, codex_home: Path,
                  environment: dict[str, str] | None = None):
         self.executable = executable
+        self.release = ""
         self.socket_path = socket_path
         self.codex_home = codex_home
         self.environment = environment or {}
@@ -86,6 +90,7 @@ class RpcClient:
         self.notifications.put_nowait(compact)
 
     async def connect(self, client_name: str) -> None:
+        self.release = await version(self.executable)
         self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         self.writer.write(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
@@ -214,6 +219,21 @@ class RpcClient:
             self._pending.clear()
 
     async def call(self, method: str, params: dict[str, Any], timeout: float = 30) -> dict[str, Any]:
+        if method == "thread/goal/set" and self.release == "codex-cli 0.166.0":
+            params = {"origin": "automatic", **params}
+        # New releases require paginated history on persisted threads. Keep only
+        # recent turn summaries for reconciliation; Codex owns full history.
+        if method == "thread/resume" and self.release == "codex-cli 0.166.0":
+            result = await self._call(method, {**params, "excludeTurns": True}, timeout)
+            page = await self._call("thread/turns/list", {
+                "threadId": params["threadId"], "limit": 100,
+                "sortDirection": "desc", "itemsView": "summary",
+            }, timeout)
+            result.setdefault("thread", {})["turns"] = list(reversed(page.get("data", [])))
+            return result
+        return await self._call(method, params, timeout)
+
+    async def _call(self, method: str, params: dict[str, Any], timeout: float = 30) -> dict[str, Any]:
         request_id = self._next_id
         self._next_id += 1
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()

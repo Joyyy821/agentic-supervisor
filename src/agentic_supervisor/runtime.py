@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .checks import run_check
-from .codex import CodexError, RpcClient, codex_executable, version
+from .codex import VALIDATED_VERSIONS, CodexError, RpcClient, codex_executable, version
 from .config import RunConfig
 from .store import ACTIVE_STATUSES, Store
 
@@ -133,11 +133,13 @@ class Runtime:
         return (socket, self.root / "runs" / run_id, self.root / "logs")
 
     def _sandbox_policy(self, run_id: str, config: RunConfig) -> dict[str, Any]:
-        roots = [config.repository, *config.writable_paths,
+        if config.sandbox_mode == "read-only":
+            return {"type": "readOnly", "networkAccess": False}
+        roots = [config.repository, *config.writable_paths, *config.artifact_paths,
                  self.root / "runs" / run_id / "artifacts"]
         return {"type": "workspaceWrite", "writableRoots": list(dict.fromkeys(str(p) for p in roots))}
 
-    async def protocol_probe(self) -> dict[str, Any]:
+    async def protocol_probe(self, config: RunConfig | None = None) -> dict[str, Any]:
         """Probe two-client Unix WebSocket transport without sending a model turn."""
         active = next((row for row in self.store.list_runs()
                        if row["status"] in ACTIVE_STATUSES and row["thread_id"]), None)
@@ -152,6 +154,7 @@ class Runtime:
                 goal = await clients[1].call("thread/goal/get", {"threadId": active["thread_id"]})
                 return {"transport": "unix-websocket", "clients": 2,
                         "model_count": len(models.get("data", [])),
+                        "models": [{"id": m["id"], "efforts": m.get("supportedReasoningEfforts", [])} for m in models.get("data", [])],
                         "shared_goal_status": (goal.get("goal") or {}).get("status"),
                         "reused_active_server": True}
             finally:
@@ -172,8 +175,14 @@ class Runtime:
         self.codex_home.chmod(0o700)
         log_path = probe_root / "app-server.log"
         with log_path.open("wb") as log:
+            argv = [self.codex, "app-server", "--listen", f"unix://{probe_socket}", "--enable", "goals"]
+            if config:
+                argv += ["-c", f"approval_policy={json.dumps(config.approval_policy)}",
+                         "-c", f"sandbox_mode={json.dumps(config.sandbox_mode)}"]
+                if config.approvals_reviewer:
+                    argv += ["-c", f"approvals_reviewer={json.dumps(config.approvals_reviewer)}"]
             server = await asyncio.create_subprocess_exec(
-                self.codex, "app-server", "--listen", f"unix://{probe_socket}", "--enable", "goals",
+                *argv,
                 stdout=log, stderr=log, env=env,
             )
             clients: list[RpcClient] = []
@@ -191,15 +200,24 @@ class Runtime:
                     await client.connect(f"agentic_supervisor_doctor_{i}")
                     clients.append(client)
                 models = await clients[0].call("model/list", {}, timeout=20)
+                effective = (await clients[0].call("config/read", {"includeLayers": False}))["config"]
+                if config and config.model:
+                    model = next((m for m in models.get("data", []) if m["id"] == config.model), None)
+                    if not model or (config.reasoning_effort and config.reasoning_effort not in
+                                     {e["reasoningEffort"] for e in model.get("supportedReasoningEfforts", [])}):
+                        raise RuntimeErrorMessage("requested model/reasoning effort is not in the authenticated catalog")
                 workspace = probe_root / "workspace"
                 workspace.mkdir(mode=0o700)
                 created = await clients[0].call("thread/start", {
-                    "cwd": str(workspace), "sandbox": "read-only", "approvalPolicy": "untrusted",
+                    "cwd": str(workspace), "sandbox": config.sandbox_mode if config else "read-only",
+                    "approvalPolicy": config.approval_policy if config else "on-request",
+                    "model": config.model if config else None,
+                    "config": {"model_reasoning_effort": config.reasoning_effort} if config and config.reasoning_effort else {},
                 }, timeout=20)
                 thread_id = created["thread"]["id"]
                 await clients[0].call("thread/goal/set", {
                     "threadId": thread_id, "objective": "Transport health check; remain paused.",
-                    "status": "paused", "tokenBudget": 1,
+                    "status": "paused", "tokenBudget": 1, "origin": "user",
                 }, timeout=20)
                 shared_goal = await clients[1].call("thread/goal/get", {"threadId": thread_id}, timeout=20)
                 goal_status = (shared_goal.get("goal") or {}).get("status")
@@ -209,8 +227,11 @@ class Runtime:
                 await clients[0].call("thread/delete", {"threadId": thread_id}, timeout=20)
                 thread_id = None
                 return {"transport": "unix-websocket", "clients": 2,
-                        "model_count": len(models.get("data", [])), "shared_goal_status": goal_status,
-                        "reused_active_server": False, "model_turns_sent": 0}
+                        "model_count": len(models.get("data", [])),
+                        "models": [{"id": m["id"], "efforts": m.get("supportedReasoningEfforts", [])} for m in models.get("data", [])], "shared_goal_status": goal_status,
+                        "reused_active_server": False, "model_turns_sent": 0,
+                        "effective_config": {k: effective.get(k) for k in ("approval_policy", "approvals_reviewer", "sandbox_mode", "web_search")},
+                        "thread_settings": {k: created.get(k) for k in ("model", "reasoningEffort", "approvalPolicy", "approvalsReviewer", "sandbox")}}
             finally:
                 if thread_id and clients:
                     try:
@@ -240,7 +261,11 @@ class Runtime:
 
     def _server_command(self, run_id: str, socket: Path, config: RunConfig, log_dir: Path) -> str:
         env = _environment(config, self.codex_home)
-        argv = [self.codex, "app-server", "--listen", f"unix://{socket}", "--enable", "goals"]
+        argv = [self.codex, "app-server", "--listen", f"unix://{socket}", "--enable", "goals",
+                "-c", f"approval_policy={json.dumps(config.approval_policy)}",
+                "-c", f"sandbox_mode={json.dumps(config.sandbox_mode)}"]
+        if config.approvals_reviewer:
+            argv += ["-c", f"approvals_reviewer={json.dumps(config.approvals_reviewer)}"]
         return self._owned_command(run_id, env, argv, log_dir / f"{run_id}-app-server.log")
 
     def _worker_command(self, run_id: str, config: RunConfig, log_dir: Path) -> str:
@@ -318,12 +343,12 @@ class Runtime:
     @staticmethod
     def instructions(run_id: str, config: RunConfig, run_dir: Path) -> str:
         contexts = "\n".join(str(p) for p in config.context_files) or "(none)"
-        artifacts = "\n".join([str(run_dir / "artifacts"), *(str(p) for p in config.writable_paths)])
+        artifacts = "\n".join([str(run_dir / "artifacts"), *(str(p) for p in (*config.writable_paths, *config.artifact_paths))])
         return (
             "You are a general-purpose development and research agent. Follow the target repository's "
             "AGENTS.md and the user's objective. Work in small checkpoints, preserve evidence, and run "
             "configured checks before claiming completion. Do not assume access to unrelated repositories. "
-            f"\nSupervisor run ID: {run_id}\nContext files:\n{contexts}\n"
+            f"\nPersistent project objective: {config.objective}\nSupervisor run ID: {run_id}\nContext files:\n{contexts}\n"
             f"Configured writable artifact paths:\n{artifacts}\n"
             "Do not claim an interrupted command completed without checking its outputs."
         )
@@ -335,7 +360,8 @@ class Runtime:
         return (
             f"Pursue this objective until its stated verification conditions are met:\n\n{config.objective}\n\n"
             f"Supervisor run: {run_id}. Record short progress checkpoints in `{run_dir / 'artifacts' / 'progress.md'}`.\n"
-            f"Configured checks available to the supervisor:\n{checks}\n"
+            f"Configured checks available to the supervisor:\n{checks}\n" +
+            ("Full initial task:\n" + config.initial_task_file.read_text(encoding="utf-8") + "\n" if config.initial_task_file else "") +
             "Follow project instructions. Ask for approval when required by the configured policy. "
             "Do not report completion until requested verification has been attempted."
         )
@@ -344,10 +370,11 @@ class Runtime:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         if any(row["status"] in ACTIVE_STATUSES for row in self.store.list_runs()):
             raise RuntimeErrorMessage("this runtime root already has a live or blocked run; inspect or recover it first")
+        self.codex = codex_executable(config.codex_executable or self.codex)
         version_text = await version(self.codex)
-        if version_text != "codex-cli 0.144.4":
+        if version_text not in VALIDATED_VERSIONS:
             raise RuntimeErrorMessage(
-                f"Codex version {version_text!r} is not validated; expected codex-cli 0.144.4"
+                f"Codex version {version_text!r} is not validated; validated versions: {sorted(VALIDATED_VERSIONS)}"
             )
         env = os.environ.copy()
         env["CODEX_HOME"] = str(self.codex_home)
@@ -357,7 +384,7 @@ class Runtime:
             raise RuntimeErrorMessage("private Codex home is not authenticated; run agentic-supervisor login")
 
         try:
-            capability = await self.protocol_probe()
+            capability = await self.protocol_probe(config)
         except Exception as exc:
             raise RuntimeErrorMessage(f"installed App Server capability probe failed: {exc}") from exc
         if capability.get("clients") != 2 or capability.get("shared_goal_status") != "paused":
@@ -368,6 +395,12 @@ class Runtime:
         if len(os.fsencode(planned_socket)) >= 100:
             raise RuntimeErrorMessage("runtime root is too deep for the host Unix socket path limit; choose a shorter root")
         run_id = self.store.create_run(config, version_text, git_head, git_dirty)
+        self.store.update_run(run_id, codex_executable=self.codex)
+        if config.initial_task_file:
+            self.store.add_event(run_id, "supervisor/task_input", {
+                "path": str(config.initial_task_file),
+                "sha256": hashlib.sha256(config.initial_task_file.read_bytes()).hexdigest(),
+            })
         session = self.store.get_run(run_id)["tmux_session"]
         try:
             socket, run_dir, log_dir = self._prepare(run_id)
@@ -378,15 +411,25 @@ class Runtime:
             try:
                 result = await client.call("thread/start", {
                     "cwd": str(config.repository),
-                    "sandbox": "workspace-write",
+                    "sandbox": config.sandbox_mode,
                     "approvalPolicy": config.approval_policy,
                     "baseInstructions": self.instructions(run_id, config, run_dir),
                     "model": config.model,
+                    "config": {"model_reasoning_effort": config.reasoning_effort} if config.reasoning_effort else {},
                 }, timeout=45)
                 thread_id = result.get("thread", {}).get("id")
                 if not isinstance(thread_id, str) or not thread_id:
                     raise RuntimeErrorMessage("Codex did not return a thread ID")
                 self.store.update_run(run_id, thread_id=thread_id)
+                self.store.add_event(run_id, "supervisor/effective_settings", {
+                    k: result.get(k) for k in ("model", "reasoningEffort", "approvalPolicy", "approvalsReviewer", "sandbox")
+                })
+                if config.approvals_reviewer and version_text == "codex-cli 0.166.0" and result.get("approvalsReviewer") != config.approvals_reviewer:
+                    raise RuntimeErrorMessage("App Server did not select the requested approval reviewer")
+                if config.model and result.get("model") != config.model:
+                    raise RuntimeErrorMessage("App Server did not select the requested model")
+                if config.reasoning_effort and result.get("reasoningEffort") != config.reasoning_effort:
+                    raise RuntimeErrorMessage("App Server did not select the requested reasoning effort")
 
                 # A newly started App Server thread has no persisted rollout yet, so
                 # thread/resume fails with "no rollout found" until its first turn.
@@ -398,7 +441,7 @@ class Runtime:
                     "threadId": thread_id,
                     "objective": "Session setup only: respond READY without using tools.",
                     "status": "paused",
-                    "tokenBudget": bootstrap_budget,
+                    "tokenBudget": bootstrap_budget, "origin": "user",
                 })
                 bootstrap = await client.call("turn/start", {
                     "threadId": thread_id,
@@ -466,20 +509,8 @@ class Runtime:
                     raise RuntimeErrorMessage(
                         "session bootstrap consumed the configured token budget; increase token_budget"
                     )
-                await client.call("thread/goal/set", {
-                    "threadId": thread_id,
-                    "objective": config.objective,
-                    "status": "active",
-                    "tokenBudget": remaining_token_budget,
-                })
-                await client.call("turn/start", {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": self.initial_prompt(run_id, config, run_dir)}],
-                    "cwd": str(config.repository),
-                    "model": config.model,
-                    "effort": config.reasoning_effort,
-                    "sandboxPolicy": self._sandbox_policy(run_id, config),
-                }, timeout=45)
+                await self.activate(client, run_id, config, self.initial_prompt(run_id, config, run_dir))
+
             finally:
                 await client.close()
 
@@ -489,13 +520,74 @@ class Runtime:
             self.store.add_event(run_id, "supervisor/start_failed", {"error": str(exc)})
             raise
 
+    @staticmethod
+    def goal_objective(row: Any) -> str:
+        if row["milestone_name"]:
+            return (f"Milestone {row['milestone_name']}: {row['milestone_objective']}\n"
+                    "Complete only this milestone, then report findings for human review. "
+                    "The overarching project continues after review; do not start a later milestone.")
+        return row["objective"]
+
+    async def activate(self, client: RpcClient, run_id: str, config: RunConfig, prompt: str) -> str:
+        row = self.store.get_run(run_id)
+        if self.store.has_uncertain_work(run_id):
+            raise ValueError("resolve uncertain operations before resuming")
+        goal = (await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}
+        if isinstance(goal.get("tokensUsed"), int):
+            self.store.observe_token_usage(run_id, goal["tokensUsed"])
+        row = self.store.get_run(run_id)
+        remaining = row["token_budget"] - row["tokens_used"]
+        if remaining <= 0 or self.store.elapsed(row) >= row["time_budget_seconds"]:
+            raise ValueError("execution budget exhausted; extend it while paused before resuming")
+        objective = self.goal_objective(row)
+        native_used = goal.get("tokensUsed", 0)
+        updated = await client.call("thread/goal/set", {
+            "threadId": row["thread_id"], "objective": objective, "status": "paused",
+            "tokenBudget": native_used + remaining, "origin": "user",
+        })
+        # Counter reset semantics differ by release. Use the acknowledged native
+        # baseline, never infer a reset just from an objective change.
+        actual_used = (updated.get("goal") or {}).get("tokensUsed")
+        if not isinstance(actual_used, int):
+            actual_used = ((await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}).get("tokensUsed", native_used)
+        self.store.update_run(run_id, native_tokens_seen=actual_used)
+        if actual_used != native_used:
+            await client.call("thread/goal/set", {"threadId": row["thread_id"],
+                "tokenBudget": actual_used + remaining, "status": "paused", "origin": "user"})
+        turn = await client.call("turn/start", {
+            "threadId": row["thread_id"], "cwd": str(config.repository),
+            "input": [{"type": "text", "text": prompt + "\nCurrent authorized goal:\n" + objective}],
+            "model": config.model, "effort": config.reasoning_effort,
+            "approvalPolicy": config.approval_policy,
+            "sandboxPolicy": self._sandbox_policy(run_id, config),
+        }, timeout=45)
+        await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "active", "origin": "user"})
+        self.store.update_run(run_id, status="active", desired_status="active", last_error=None,
+                              milestone_status="active" if row["milestone_name"] else None)
+        return turn.get("turn", {}).get("id") or "pending"
+
     def submit(self, run_id: str, kind: str, payload: str = "") -> str:
         row = self.store.get_run(run_id)
         terminal = {"complete", "validation_failed", "stopped", "failed"}
+        if row["status"] in terminal and kind == "stop":
+            control_id = self.store.queue_control(run_id, kind, payload)
+            self.tmux("kill-session", "-t", row["tmux_session"], check=False)
+            self.store.update_run(run_id, status="stopped", desired_status="stopped")
+            self.store.update_control(control_id, "confirmed", "closed owned terminal runtime")
+            return control_id
         if row["status"] in terminal and kind != "resolve":
             raise RuntimeErrorMessage(f"run is terminal ({row['status']})")
         if row["desired_status"] == "stopped" and kind != "resolve":
             raise RuntimeErrorMessage("run has a stop request in progress")
+        if kind == "resume":
+            if row["status"] != "paused" or row["desired_status"] != "paused":
+                raise RuntimeErrorMessage("resume requires a confirmed paused run")
+            if row["milestone_status"] == "review":
+                raise RuntimeErrorMessage("assign the next milestone (or a revision) before resuming")
+            if self.store.has_uncertain_work(run_id):
+                raise RuntimeErrorMessage("resolve uncertain operations before resuming")
+            if row["tokens_used"] >= row["token_budget"] or self.store.elapsed(row) >= row["time_budget_seconds"]:
+                raise RuntimeErrorMessage("extend the exhausted budget before resuming")
         control_id = self.store.queue_control(run_id, kind, payload)
         if kind in {"pause", "stop"}:
             self.store.update_run(run_id, desired_status="paused" if kind == "pause" else "stopped")
@@ -514,7 +606,10 @@ class Runtime:
         if row["status"] == "blocked" and row["last_error"] == "validation command outcome requires resolution":
             config = config_from_snapshot(json.loads(row["config_json"]))
             attempts = {attempt["name"]: attempt["status"] for attempt in self.store.attempts(run_id)}
-            if config.checks and attempt["name"] in {check.name for check in config.checks} and all(
+            if row["milestone_name"] and not self.store.has_uncertain_work(run_id):
+                self.store.update_run(run_id, status="paused", desired_status="paused", milestone_status="review",
+                                      last_error="validation outcome resolved; review evidence before the next milestone")
+            if not row["milestone_name"] and config.checks and attempt["name"] in {check.name for check in config.checks} and all(
                    check.name in attempts and attempts[check.name] not in {"running", "outcome_unknown"}
                    for check in config.checks):
                 final_status = "complete" if all(attempts[check.name] == "succeeded"
@@ -535,6 +630,9 @@ class Runtime:
 
     def recover(self, run_id: str) -> None:
         row = self.store.get_run(run_id)
+        self.codex = codex_executable(row["codex_executable"] or self.codex)
+        if row["codex_executable"] and asyncio.run(version(self.codex)) != row["codex_version"]:
+            raise RuntimeErrorMessage("recorded Codex executable changed version; restore the pinned binary before recovery")
         if row["status"] in {"complete", "validation_failed", "stopped", "failed"}:
             raise RuntimeErrorMessage(f"terminal runs retain history and cannot be restarted ({row['status']})")
         if row["desired_status"] == "stopped":
@@ -559,6 +657,11 @@ class Runtime:
             self.tmux("respawn-window", "-k", "-t", f"{session}:app-server", command)
             server_restarted = True
 
+        if server_restarted:
+            unknown_native = self.store.mark_native_operations_unknown(run_id)
+            if unknown_native:
+                self.store.update_run(run_id, desired_status="paused")
+                row = self.store.get_run(run_id)
         self.store.update_run(run_id, status="recovering")
         try:
             turns, native_status, observed = asyncio.run(
@@ -616,19 +719,20 @@ class Runtime:
                         "threadId": row["thread_id"], "turnId": active_turn["id"],
                     })
                 observed = "paused"
-            elif total_tokens >= row["token_budget"]:
+            elif (total_tokens >= row["token_budget"] or self.store.elapsed(row) >= row["time_budget_seconds"] or
+                  self.store.has_uncertain_work(row["id"])):
                 await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
                 if active_turn and active_turn.get("id"):
                     await client.call("turn/interrupt", {
                         "threadId": row["thread_id"], "turnId": active_turn["id"],
                     })
                 self.store.update_run(row["id"], desired_status="paused",
-                                      last_error="supervisor token budget reached")
+                                      last_error="budget expired or operation requires resolution")
                 observed = "paused"
             elif row["desired_status"] == "active":
                 if native_status == "paused":
-                    await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "active"})
-                    native_status = "active"
+                    self.store.update_run(row["id"], desired_status="paused")
+                    return turns, native_status, "paused"
                 observed = "active" if native_status == "active" else "recovering"
             else:
                 observed = "blocked"
@@ -673,6 +777,11 @@ def config_from_snapshot(snapshot: dict[str, Any]) -> RunConfig:
         token_budget=snapshot["token_budget"], time_budget_seconds=snapshot["time_budget_seconds"],
         environment_allowlist=tuple(snapshot.get("environment_allowlist", [])),
         writable_paths=tuple(Path(x) for x in snapshot.get("writable_paths", [])),
+        codex_executable=snapshot.get("codex_executable"), approvals_reviewer=snapshot.get("approvals_reviewer"),
+        sandbox_mode=snapshot.get("sandbox_mode", "workspace-write"),
+        artifact_paths=tuple(Path(p) for p in snapshot.get("artifact_paths", [])),
+        milestone=snapshot.get("milestone"),
+        initial_task_file=Path(snapshot["initial_task_file"]) if snapshot.get("initial_task_file") else None,
         checks=tuple(Check(c["name"], tuple(c["command"]), Path(c["cwd"]), c["timeout_seconds"],
                            tuple(Path(x) for x in c.get("result_files", [])))
                      for c in snapshot.get("checks", [])),
@@ -759,6 +868,7 @@ async def run_worker(root: Path, run_id: str) -> None:
         if not row["thread_id"]:
             raise RuntimeErrorMessage("run has no confirmed thread ID; inspect startup outcome before retrying")
         config = config_from_snapshot(json.loads(row["config_json"]))
+        runtime.codex = codex_executable(row["codex_executable"] or config.codex_executable or runtime.codex)
         socket = runtime.app_socket(run_id)
         client = RpcClient(runtime.codex, socket, runtime.codex_home, _environment(config, runtime.codex_home))
         try:
@@ -776,7 +886,7 @@ async def run_worker(root: Path, run_id: str) -> None:
                           for turn in turns if isinstance(turn, dict)],
             })
             last_budget_check = 0.0
-            checked_completion = False
+            checked_generation = None
             while True:
                 row = store.get_run(run_id)
                 for control in store.pending_controls(run_id):
@@ -785,6 +895,7 @@ async def run_worker(root: Path, run_id: str) -> None:
                         store.update_control(control["id"], "waiting_resume", "delivery waits for an explicit resume")
                         continue
                     store.update_control(control["id"], "dispatched")
+                    resumed_inputs = []
                     try:
                         if kind in {"send", "queue"}:
                             if kind == "send" and active_turn and active_turn != "pending":
@@ -808,7 +919,7 @@ async def run_worker(root: Path, run_id: str) -> None:
                                 store.update_control(control["id"], "accepted", "follow-up turn accepted")
                         elif kind == "pause":
                             await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
-                            interrupted = await self._interrupt_active_turn(client, row["thread_id"], active_turn)
+                            interrupted = await runtime._interrupt_active_turn(client, row["thread_id"], active_turn)
                             if interrupted:
                                 active_turn = None
                                 store.update_run(run_id, status="paused", desired_status="paused")
@@ -823,13 +934,21 @@ async def run_worker(root: Path, run_id: str) -> None:
                             store.update_control(control["id"], "confirmed", "active turn interrupted")
                         elif kind == "stop":
                             await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
-                            await self._interrupt_active_turn(client, row["thread_id"], active_turn)
+                            await runtime._interrupt_active_turn(client, row["thread_id"], active_turn)
                             active_turn = None
                             store.update_control(control["id"], "confirmed", "goal paused before owned session shutdown")
                         elif kind == "resume":
-                            await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "active"})
-                            active_turn = None
-                            store.update_run(run_id, status="active", desired_status="active", last_error=None)
+                            resumed_inputs = sorted([c for c in store.controls(run_id)
+                                if c["kind"] in {"send", "queue"} and c["status"] in {"waiting_resume", "waiting_turn", "queued"}],
+                                key=lambda c: (c["created_at"], c["id"]))
+                            for queued in resumed_inputs:
+                                store.update_control(queued["id"], "dispatched")
+                            prompt = "Continue the existing project in this same thread. Read prior findings and decisions before proceeding."
+                            if resumed_inputs:
+                                prompt += "\nQueued human instructions, in order:\n" + "\n".join(c["payload"] for c in resumed_inputs)
+                            active_turn = await runtime.activate(client, run_id, config, prompt)
+                            for queued in resumed_inputs:
+                                store.update_control(queued["id"], "accepted", "included in resumed turn")
                             store.release_waiting_controls(run_id)
                             store.update_control(control["id"], "confirmed", "goal resumed")
                         elif kind == "resolve":
@@ -850,11 +969,16 @@ async def run_worker(root: Path, run_id: str) -> None:
                         else:
                             store.update_control(control["id"], "failed", f"unsupported control: {kind}")
                     except (CodexError, asyncio.TimeoutError) as exc:
+                        for queued in resumed_inputs:
+                            store.update_control(queued["id"], "outcome_unknown", str(exc))
                         store.update_control(control["id"], "outcome_unknown", str(exc))
-                        store.update_run(run_id, status="recovering", last_error=str(exc))
+                        store.update_run(run_id, status="recovering", desired_status="paused", last_error=str(exc))
                         store.add_event(run_id, "supervisor/control_outcome_unknown",
                                         {"control_id": control["id"], "error": str(exc)})
                     except (ValueError, KeyError, json.JSONDecodeError) as exc:
+                        for queued in resumed_inputs:
+                            store.update_control(queued["id"], "waiting_resume", "resume precondition failed before dispatch")
+                        store.update_run(run_id, status="paused", desired_status="paused", last_error=str(exc))
                         store.update_control(control["id"], "failed", str(exc))
                         store.add_event(run_id, "supervisor/control_failed", {
                             "control_id": control["id"], "error": str(exc),
@@ -870,8 +994,7 @@ async def run_worker(root: Path, run_id: str) -> None:
                     return
 
                 now = time.time()
-                start = float(row["started_at"] or row["created_at"])
-                if now - start >= row["time_budget_seconds"] and row["status"] == "active":
+                if store.elapsed(row) >= row["time_budget_seconds"] and row["status"] == "active":
                     await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
                     if active_turn and active_turn != "pending":
                         await client.call("turn/interrupt", {"threadId": row["thread_id"], "turnId": active_turn})
@@ -920,16 +1043,18 @@ async def run_worker(root: Path, run_id: str) -> None:
                                 store.add_event(run_id, "supervisor/token_budget_reached", {
                                     "tokens_used": total_tokens, "token_budget": row["token_budget"],
                                 })
-                        if status == "complete" and row["status"] not in {"complete", "stopped", "validation_failed"}:
-                            if not checked_completion:
-                                checked_completion = True
+                        if status == "paused" and row["status"] == "active" and not active_turn:
+                            store.update_run(run_id, status="paused", desired_status="paused",
+                                             last_error="native goal paused; inspect progress before resuming")
+                        if status == "complete" and not active_turn and row["status"] not in {"complete", "stopped", "validation_failed"}:
+                            if checked_generation != row["milestone_generation"] and row["milestone_status"] != "review":
+                                checked_generation = row["milestone_generation"]
                                 outcomes = []
                                 for check in config.checks:
                                     latest = store.get_run(run_id)
-                                    started = float(latest["started_at"] or latest["created_at"])
-                                    remaining = int(latest["time_budget_seconds"] - (time.time() - started))
+                                    remaining = int(latest["time_budget_seconds"] - store.elapsed(latest))
                                     if remaining <= 0:
-                                        attempt_id = store.create_attempt(run_id, check.name, list(check.command))
+                                        attempt_id = store.create_attempt(run_id, f"{row['milestone_generation']}/{check.name}" if row["milestone_name"] else check.name, list(check.command))
                                         store.resolve_attempt(run_id, attempt_id, "not_run",
                                                               "elapsed-time budget reached before dispatch")
                                         outcomes.append({"attempt_id": attempt_id, "name": check.name,
@@ -941,21 +1066,34 @@ async def run_worker(root: Path, run_id: str) -> None:
                                         continue
                                     outcomes.append(await run_check(client, store, run_id, check,
                                                                    runtime.root / "runs" / run_id,
-                                                                   timeout_limit=remaining))
+                                                                   timeout_limit=remaining,
+                                                                   scope=str(row["milestone_generation"]) if row["milestone_name"] else None,
+                                                                   sandbox_policy=runtime._sandbox_policy(run_id, config)))
                                 unknown = any(x["status"] in {"outcome_unknown", "not_run"} for x in outcomes)
                                 if unknown:
                                     store.update_run(run_id, status="blocked", desired_status="blocked",
                                                      last_error="validation command outcome requires resolution")
                                     store.add_event(run_id, "supervisor/validation_blocked", {"checks": outcomes})
                                 else:
+                                    if row["milestone_name"]:
+                                        await runtime._interrupt_active_turn(client, row["thread_id"], active_turn)
+                                        active_turn = None
+                                        store.update_run(run_id, status="paused", desired_status="paused",
+                                                         milestone_status="review", last_error=None if all(x["status"] == "succeeded" for x in outcomes) else "milestone validation failed")
+                                        store.add_event(run_id, "supervisor/milestone_review", {
+                                            "milestone": row["milestone_name"], "checks": outcomes,
+                                            "thread_id": row["thread_id"], "tokens_used": total_tokens,
+                                        })
+                                        continue
                                     final_status = "complete" if all(x["status"] == "succeeded" for x in outcomes) else "validation_failed"
                                     store.update_run(run_id, status=final_status, desired_status=final_status,
                                                      finished_at=time.time())
                                     store.add_event(run_id, "supervisor/goal_completed", {"checks": outcomes})
                                     if final_status in {"complete", "validation_failed"}:
                                         return
-                        elif status in {"usageLimited", "budgetLimited"} and row["status"] not in {"complete", "stopped"}:
-                            store.update_run(run_id, status="blocked", desired_status="blocked",
+                        elif status in {"usageLimited", "budgetLimited", "blocked"} and row["status"] not in {"complete", "stopped"}:
+                            store.update_run(run_id, status="paused" if status == "budgetLimited" else "blocked",
+                                             desired_status="paused" if status == "budgetLimited" else "blocked",
                                              last_error=f"Codex goal status: {status}")
                             store.add_event(run_id, "supervisor/goal_limited", {"goal_status": status})
                     except CodexError as exc:
@@ -972,13 +1110,25 @@ async def run_worker(root: Path, run_id: str) -> None:
                         client.dropped_notifications = 0
                     continue
                 method = message.get("method", "unknown")
+                if method == "supervisor/disconnected":
+                    raise CodexError("App Server disconnected; recover the existing run")
                 raw_params = message.get("params", {})
+                if isinstance(raw_params, dict) and raw_params.get("threadId") not in {None, row["thread_id"]}:
+                    continue
                 params, native_id = _event_summary(method, raw_params if isinstance(raw_params, dict) else {})
                 store.add_event(run_id, method, params, native_id)
                 if method == "turn/started":
-                    active_turn = params.get("turn_id")
+                    if active_turn in {None, "pending", params.get("turn_id")}:
+                        active_turn = params.get("turn_id")
                 elif method == "turn/completed":
-                    active_turn = None
+                    was_active = active_turn in {"pending", params.get("turn_id")}
+                    if was_active:
+                        active_turn = None
+                    if was_active and params.get("status") == "failed":
+                        await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
+                        store.update_run(run_id, status="paused", desired_status="paused",
+                                         last_error="Codex turn failed; inspect the native TUI before resuming")
+                        store.add_event(run_id, "supervisor/turn_failed", params)
                     try:
                         checkpoint = await asyncio.to_thread(git_checkpoint, config.repository)
                         store.add_event(run_id, "supervisor/git_checkpoint", checkpoint,
@@ -996,11 +1146,6 @@ async def run_worker(root: Path, run_id: str) -> None:
                     store.add_event(run_id, "supervisor/approval_pending", {
                         "method": method, "request_id": params.get("request_id"),
                     })
-                elif method == "thread/goal/updated":
-                    if params.get("status") == "paused":
-                        store.update_run(run_id, status="pausing" if active_turn else "paused")
-                    elif params.get("status") == "active":
-                        store.update_run(run_id, status="active")
                 if client.dropped_notifications:
                     store.add_event(run_id, "supervisor/event_gap", {
                         "dropped_notifications": client.dropped_notifications,

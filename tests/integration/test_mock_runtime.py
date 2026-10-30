@@ -22,6 +22,8 @@ class FakeRpc:
         self.calls.append((method, params))
         if method == "thread/start":
             return {"thread": {"id": "thread-fixture"}}
+        if method == "thread/goal/set":
+            return {"goal": {"tokensUsed": 17}}
         if method == "turn/start":
             self.turn_starts += 1
             return {"turn": {"id": "bootstrap-turn" if self.turn_starts == 1 else "turn-fixture"}}
@@ -80,10 +82,10 @@ class MockRuntimeTests(unittest.TestCase):
         ])
         self.assertEqual(client1.calls[1][1]["status"], "paused")
         self.assertEqual(client1.calls[2][1]["sandboxPolicy"]["type"], "readOnly")
-        self.assertEqual([method for method, _ in client2.calls], ["thread/goal/set", "turn/start"])
-        self.assertEqual(client2.calls[0][1]["tokenBudget"], 29983)
-        self.assertEqual(client2.calls[1][1]["sandboxPolicy"]["type"], "workspaceWrite")
-        self.assertIn(str(repo), client2.calls[1][1]["sandboxPolicy"]["writableRoots"])
+        self.assertEqual([method for method, _ in client2.calls], ["thread/goal/get", "thread/goal/set", "turn/start", "thread/goal/set"])
+        self.assertEqual(client2.calls[1][1]["tokenBudget"], 30000)
+        self.assertEqual(client2.calls[2][1]["sandboxPolicy"]["type"], "workspaceWrite")
+        self.assertIn(str(repo), client2.calls[2][1]["sandboxPolicy"]["writableRoots"])
         self.assertTrue(any("supervisor" in call.args for call in tmux.call_args_list))
         worker_call = next(call for call in tmux.call_args_list
                            if "supervisor" in call.args and "worker" in str(call.args[-1]))

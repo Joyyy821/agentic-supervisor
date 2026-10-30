@@ -20,6 +20,7 @@ class ProtocolContractTests(unittest.TestCase):
         root = test_root() / f"p-{uuid.uuid4().hex[:8]}"
         home = root / "codex-home"
         home.mkdir(parents=True, mode=0o700)
+        root.chmod(0o700)
         socket = root / "s.sock"
         env = {key: value for key, value in os.environ.items()
                if key in {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL"}}
@@ -52,12 +53,12 @@ class ProtocolContractTests(unittest.TestCase):
 
                     repository = new_git_repo("protocol-repo")
                     created = await clients[0].call("thread/start", {
-                        "cwd": str(repository), "sandbox": "read-only", "approvalPolicy": "untrusted",
+                        "cwd": str(repository), "sandbox": "read-only", "approvalPolicy": "on-request",
                     })
                     thread_id = created["thread"]["id"]
                     await clients[0].call("thread/goal/set", {
                         "threadId": thread_id, "objective": "Protocol contract", "status": "paused",
-                        "tokenBudget": 100,
+                        "tokenBudget": 100, "origin": "user",
                     })
                     goal = await clients[1].call("thread/goal/get", {"threadId": thread_id})
                     self.assertEqual(goal["goal"]["status"], "paused")

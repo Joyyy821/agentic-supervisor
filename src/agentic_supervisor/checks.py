@@ -13,8 +13,10 @@ from .store import Store
 
 
 async def run_check(client: RpcClient, store: Store, run_id: str, check: Check,
-                    output_dir: Path, timeout_limit: int | None = None) -> dict[str, object]:
-    previous = [attempt for attempt in store.attempts(run_id) if attempt["name"] == check.name]
+                    output_dir: Path, timeout_limit: int | None = None, scope: str | None = None,
+                    sandbox_policy: dict | None = None) -> dict[str, object]:
+    attempt_name = f"{scope}/{check.name}" if scope is not None else check.name
+    previous = [attempt for attempt in store.attempts(run_id) if attempt["name"] == attempt_name]
     if previous and previous[-1]["status"] != "not_run":
         attempt = previous[-1]
         try:
@@ -25,7 +27,7 @@ async def run_check(client: RpcClient, store: Store, run_id: str, check: Check,
                 "exit_code": attempt["exit_code"], "artifacts": result.get("artifacts", {}),
                 "reused_after_recovery": True}
 
-    attempt_id = store.create_attempt(run_id, check.name, list(check.command))
+    attempt_id = store.create_attempt(run_id, attempt_name, list(check.command))
     attempt_dir = output_dir / "artifacts" / "attempts" / attempt_id
     attempt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if check.cwd.resolve() != check.cwd or not check.cwd.is_dir():
@@ -45,7 +47,7 @@ async def run_check(client: RpcClient, store: Store, run_id: str, check: Check,
         response = await client.call("command/exec", {
             "command": list(check.command),
             "cwd": str(check.cwd),
-            "sandboxPolicy": {"type": "workspaceWrite", "writableRoots": writable_roots},
+            "sandboxPolicy": sandbox_policy or {"type": "workspaceWrite", "writableRoots": writable_roots},
             "timeoutMs": timeout_seconds * 1000,
         }, timeout=timeout_seconds + 10)
     except Exception as exc:

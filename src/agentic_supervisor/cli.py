@@ -9,10 +9,11 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .codex import codex_executable, version
+from .codex import VALIDATED_VERSIONS, codex_executable, version
 from .config import ConfigError, load_config
 from .runtime import Runtime, RuntimeErrorMessage
 
@@ -28,10 +29,12 @@ def default_root() -> Path:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="agentic-supervisor", description="Manage persistent Codex runs")
     result.add_argument("--runtime-root", help="private runtime root (or set AGENTIC_SUPERVISOR_HOME)")
+    result.add_argument("--codex", help="explicit Codex executable (or AGENTIC_SUPERVISOR_CODEX)")
     commands = result.add_subparsers(dest="command", required=True)
 
     commands.add_parser("login", help="sign in under the private supervisor Codex home")
-    commands.add_parser("doctor", help="check Codex, authentication, runtime paths, and tmux")
+    doctor = commands.add_parser("doctor", help="check Codex, authentication, runtime paths, and tmux")
+    doctor.add_argument("--config", help="validate a project configuration and its model/settings")
     start = commands.add_parser("start", help="start a detached autonomous run")
     start.add_argument("config")
     commands.add_parser("list", help="list saved runs")
@@ -51,6 +54,14 @@ def parser() -> argparse.ArgumentParser:
     for name in ("pause", "resume", "interrupt", "stop", "recover"):
         item = commands.add_parser(name)
         item.add_argument("run_id")
+    budget = commands.add_parser("budget", help="extend a paused run's cumulative execution limits")
+    budget.add_argument("run_id")
+    budget.add_argument("--add-tokens", type=int, default=0)
+    budget.add_argument("--add-seconds", type=int, default=0)
+    milestone = commands.add_parser("milestone", help="assign the next milestone to a paused project")
+    milestone.add_argument("run_id")
+    milestone.add_argument("name")
+    milestone.add_argument("--objective", required=True)
     resolve = commands.add_parser("resolve")
     resolve.add_argument("run_id")
     resolve.add_argument("target_id")
@@ -71,13 +82,14 @@ def _private_config(home: Path) -> None:
         config.chmod(0o600)
 
 
-def _doctor(root: Path, runtime: Runtime | None) -> int:
+def _doctor(root: Path, runtime: Runtime | None, config=None) -> int:
     results: dict[str, Any] = {"runtime_root": str(root), "checks": {}}
     checks = results["checks"]
     executable = runtime.codex if runtime else codex_executable()
+    checks["codex_executable"] = executable
     try:
         checks["codex"] = awaitable_version(executable)
-        checks["codex_supported"] = checks["codex"] == "codex-cli 0.144.4"
+        checks["codex_supported"] = checks["codex"] in VALIDATED_VERSIONS
     except Exception as exc:
         checks["codex_error"] = str(exc)
         checks["codex_supported"] = False
@@ -99,7 +111,7 @@ def _doctor(root: Path, runtime: Runtime | None) -> int:
         checks["authenticated"] = False
         checks["auth_status"] = f"could not verify private Codex home: {exc}"
     try:
-        checks["app_server"] = asyncio.run(runtime.protocol_probe()) if runtime else None
+        checks["app_server"] = asyncio.run(runtime.protocol_probe(config)) if runtime else None
         checks["protocol_ready"] = checks["app_server"] is not None
     except Exception as exc:
         checks["protocol_error"] = str(exc)
@@ -127,6 +139,11 @@ def _print_status(runtime: Runtime, run_id: str) -> None:
         "git_dirty_at_start": bool(row["git_dirty"]), "created_at": row["created_at"],
         "started_at": row["started_at"], "last_error": row["last_error"],
         "tokens_used": row["tokens_used"], "token_budget": row["token_budget"],
+        "codex_executable": row["codex_executable"],
+        "elapsed_seconds": runtime.store.elapsed(row), "time_budget_seconds": row["time_budget_seconds"],
+        "milestone": {"name": row["milestone_name"], "objective": row["milestone_objective"],
+                      "status": row["milestone_status"], "tokens_used": row["tokens_used"] - row["stage_token_start"],
+                      "elapsed_seconds": runtime.store.elapsed(row) - row["stage_time_start"]} if row["milestone_name"] else None,
         "latest_checkpoint": json.loads(checkpoint["payload_json"]) if checkpoint else None,
         "attempts": [{"id": a["id"], "name": a["name"], "status": a["status"],
                        "exit_code": a["exit_code"]} for a in attempts],
@@ -156,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     root = Path(args.runtime_root).expanduser().resolve() if args.runtime_root else default_root()
     if args.command == "login":
-        executable = codex_executable()
+        executable = codex_executable(args.codex)
         home = root / "codex-home"
         _private_config(home)
         env = os.environ.copy()
@@ -164,15 +181,20 @@ def main(argv: list[str] | None = None) -> int:
         command = [executable, "login", "--device-auth"]
         return subprocess.run(command, env=env).returncode
     if args.command == "doctor":
-        return _doctor(root, Runtime(root))
+        config = load_config(args.config, args.runtime_root) if args.config else None
+        if config:
+            root = config.runtime_root
+        return _doctor(root, Runtime(root, args.codex or (config.codex_executable if config else None)), config)
 
     if args.command == "start":
         config = load_config(args.config, args.runtime_root)
-        runtime = Runtime(config.runtime_root)
+        if args.codex:
+            config = replace(config, codex_executable=codex_executable(args.codex))
+        runtime = Runtime(config.runtime_root, config.codex_executable)
         run_id = asyncio.run(runtime.start(config))
         print(run_id)
         return 0
-    runtime = Runtime(root)
+    runtime = Runtime(root, args.codex)
     if args.command == "list":
         for row in runtime.store.list_runs():
             print(json.dumps({"id": row["id"], "project": row["project"], "status": row["status"],
@@ -192,6 +214,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "recover":
         runtime.recover(args.run_id)
         print("recovery worker started; inspect status and events")
+        return 0
+    if args.command == "budget":
+        runtime.store.extend_budget(args.run_id, args.add_tokens, args.add_seconds)
+        _print_status(runtime, args.run_id)
+        return 0
+    if args.command == "milestone":
+        runtime.store.set_milestone(args.run_id, args.name, args.objective)
+        _print_status(runtime, args.run_id)
         return 0
     if args.command == "send":
         kind = "queue" if args.queue else "send"
