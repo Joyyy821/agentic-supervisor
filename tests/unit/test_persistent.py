@@ -116,8 +116,8 @@ class PersistentTests(unittest.TestCase):
             self.rt.store.observe_token_usage(self.run,20)
             client=AsyncMock()
             client.call.side_effect=[{'goal':{'objective':'old goal','tokensUsed':20,'status':'complete'}},
-                                     {'goal':{'tokensUsed':0}}, {}, {'turn':{'id':'new'}}, {}]
-            await self.rt.activate(client,self.run,self.cfg,'next stage')
+                                     {'goal':{'tokensUsed':0}}, {'turn':{'id':'new'}}, {}]
+            self.assertEqual(await self.rt.activate(client,self.run,self.cfg,'next stage'), 'new')
             self.assertIsNone(client.call.call_args_list[1].args[1]['tokenBudget'])
             self.assertEqual(self.rt.store.get_run(self.run)['native_tokens_seen'],0)
             self.rt.store.observe_token_usage(self.run,5)

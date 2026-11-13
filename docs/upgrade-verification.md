@@ -1,5 +1,10 @@
 # Codex 0.166.0 and persistent-project verification
 
+This is a historical launch record. Its dated M1a status and example commands
+below describe the 2026-10-30 observation, not current project state or the
+current supervisor token policy. Check live status and [operations](operations.md)
+before acting; do not infer that M1b has not started from this record.
+
 Verified on 2026-10-30. The original [M0 report](m0-verification.md) remains historical evidence for 0.144.4.
 
 ## Installation and protocol

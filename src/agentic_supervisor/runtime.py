@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -43,6 +44,18 @@ def acquire_worker_lock(runtime_root: Path) -> int:
         os.close(fd)
         raise WorkerAlreadyRunning("a supervisor worker already owns this runtime root") from exc
     return fd
+
+
+@contextmanager
+def lifecycle_lock(runtime_root: Path):
+    """Serialize operator pause/stop with automatic continuation dispatch."""
+    fd = os.open(runtime_root / "lifecycle.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def git_metadata(repository: Path) -> tuple[str, bool]:
@@ -535,10 +548,16 @@ class Runtime:
         row = self.store.get_run(run_id)
         if self.store.elapsed(row) >= row["time_budget_seconds"]:
             raise ValueError("elapsed-time budget exhausted; extend it while paused before resuming")
+        remaining = None
+        if config.token_budget_mode == "legacy_hard_limit":
+            remaining = row["token_budget"] - row["tokens_used"]
+            if remaining <= 0:
+                raise ValueError("legacy token budget exhausted; extend it or migrate policy while paused")
         objective = self.goal_objective(row)
+        native_used = goal.get("tokensUsed", 0)
         updated = await client.call("thread/goal/set", {
             "threadId": row["thread_id"], "objective": objective, "status": "paused",
-            "tokenBudget": None, "origin": origin,
+            "tokenBudget": native_used + remaining if remaining is not None else None, "origin": origin,
         })
         # Counter reset semantics differ by release. Use the acknowledged native
         # baseline, never infer a reset just from an objective change.
@@ -546,6 +565,9 @@ class Runtime:
         if not isinstance(actual_used, int):
             actual_used = ((await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}).get("tokensUsed", goal.get("tokensUsed", 0))
         self.store.update_run(run_id, native_tokens_seen=actual_used)
+        if remaining is not None and actual_used != native_used:
+            await client.call("thread/goal/set", {"threadId": row["thread_id"],
+                "tokenBudget": actual_used + remaining, "status": "paused", "origin": origin})
         turn = await client.call("turn/start", {
             "threadId": row["thread_id"], "cwd": str(config.repository),
             "input": [{"type": "text", "text": prompt + "\nCurrent authorized goal:\n" + objective}],
@@ -559,6 +581,12 @@ class Runtime:
         return turn.get("turn", {}).get("id") or "pending"
 
     def submit(self, run_id: str, kind: str, payload: str = "") -> str:
+        if kind in {"pause", "stop"}:
+            with lifecycle_lock(self.root):
+                return self._submit_unlocked(run_id, kind, payload)
+        return self._submit_unlocked(run_id, kind, payload)
+
+    def _submit_unlocked(self, run_id: str, kind: str, payload: str = "") -> str:
         row = self.store.get_run(run_id)
         terminal = {"complete", "validation_failed", "stopped", "failed"}
         if row["status"] in terminal and kind == "stop":
@@ -578,6 +606,9 @@ class Runtime:
                 raise RuntimeErrorMessage("assign the next milestone (or a revision) before resuming")
             if self.store.has_uncertain_work(run_id):
                 raise RuntimeErrorMessage("resolve uncertain operations before resuming")
+            snapshot = json.loads(row["config_json"])
+            if snapshot.get("token_budget_mode", "legacy_hard_limit") == "legacy_hard_limit" and row["tokens_used"] >= row["token_budget"]:
+                raise RuntimeErrorMessage("legacy token budget exhausted; extend it or migrate policy while paused")
             if self.store.elapsed(row) >= row["time_budget_seconds"]:
                 raise RuntimeErrorMessage("extend the elapsed-time budget before resuming")
         control_id = self.store.queue_control(run_id, kind, payload)
@@ -588,7 +619,7 @@ class Runtime:
                 self.store.update_usage_wait(run_id, state="cancelled")
         elif kind == "resume":
             self.store.update_run(run_id, desired_status="active")
-        elif kind in {"send", "queue"} and row["desired_status"] in {"paused", "blocked"}:
+        elif kind in {"send", "queue"} and (row["desired_status"] in {"paused", "blocked"} or row["status"] == "usage_wait"):
             self.store.update_control(control_id, "waiting_resume", "delivery waits for an explicit resume")
         return control_id
 
@@ -623,6 +654,40 @@ class Runtime:
         assert binary
         os.execv(binary, [binary, "-S", str(self.tmux_socket), "attach-session", "-t", row["tmux_session"]])
 
+    def migrate_policy(self, run_id: str, unbound_tokens: bool, auto_resume: bool | None) -> None:
+        """Change a paused snapshot only after the owned worker and native turn are idle."""
+        with lifecycle_lock(self.root):
+            row = self.store.get_run(run_id)
+            if row["status"] != "paused" or row["desired_status"] != "paused":
+                raise RuntimeErrorMessage("policy migration requires a confirmed paused run")
+            if row["codex_version"] != "codex-cli 0.166.0":
+                raise RuntimeErrorMessage("policy migration is validated only for Codex 0.166.0")
+            if self.store.has_uncertain_work(run_id) or self.store.unfinished_native_effects(run_id):
+                raise RuntimeErrorMessage("resolve uncertain or unfinished operations before policy migration")
+            self.tmux("has-session", "-t", row["tmux_session"])
+            pane = self.tmux("list-panes", "-t", f"{row['tmux_session']}:supervisor",
+                             "-F", "#{pane_dead}", check=False)
+            if pane.returncode == 0 and pane.stdout.strip() != "1":
+                raise RuntimeErrorMessage("stop only the owned supervisor worker before policy migration")
+            self.codex = codex_executable(row["codex_executable"] or self.codex)
+            if asyncio.run(version(self.codex)) != row["codex_version"]:
+                raise RuntimeErrorMessage("recorded Codex executable changed version")
+            asyncio.run(self._check_policy_native(row))
+            self.store.migrate_policy(run_id, unbound_tokens, auto_resume)
+
+    async def _check_policy_native(self, row: Any) -> None:
+        client = await self.connect_when_ready(self.app_socket(row["id"]), 10)
+        try:
+            response = await client.call("thread/read", {"threadId": row["thread_id"], "includeTurns": False})
+            thread = response.get("thread") or {}
+            status = thread.get("status") or {}
+            goal = (await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}
+            if (thread.get("id") != row["thread_id"] or status.get("type") != "idle" or
+                    goal.get("status") not in {"paused", "complete"}):
+                raise RuntimeErrorMessage("native thread must be idle with a paused or completed goal; inspect approvals and work")
+        finally:
+            await client.close()
+
     def recover(self, run_id: str) -> None:
         row = self.store.get_run(run_id)
         self.codex = codex_executable(row["codex_executable"] or self.codex)
@@ -640,6 +705,10 @@ class Runtime:
             raise RuntimeErrorMessage("worker pane is still running; inspect status before recovering")
         config = config_from_snapshot(json.loads(row["config_json"]))
         interrupted = self.store.mark_interrupted_work_unknown(run_id)
+        waiting = self.store.usage_wait(run_id)
+        if waiting and waiting["state"] == "dispatching":
+            self.store.update_usage_wait(run_id, state="outcome_unknown",
+                                         last_error="worker stopped during automatic dispatch")
         socket = self.app_socket(run_id)
         server = self.tmux("list-panes", "-t", f"{session}:app-server", "-F", "#{pane_dead}", check=False)
         command = self._server_command(run_id, socket, config, self.root / "logs")
@@ -708,13 +777,15 @@ class Runtime:
             else:
                 total_tokens = row["tokens_used"]
             if row["desired_status"] == "paused":
-                await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
+                if native_status != "complete":
+                    await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
                 if active_turn and active_turn.get("id"):
                     await client.call("turn/interrupt", {
                         "threadId": row["thread_id"], "turnId": active_turn["id"],
                     })
                 observed = "paused"
-            elif (self.store.elapsed(row) >= row["time_budget_seconds"] or
+            elif ((config.token_budget_mode == "legacy_hard_limit" and total_tokens >= row["token_budget"]) or
+                  self.store.elapsed(row) >= row["time_budget_seconds"] or
                   self.store.has_uncertain_work(row["id"])):
                 await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
                 if active_turn and active_turn.get("id"):
@@ -781,6 +852,7 @@ def config_from_snapshot(snapshot: dict[str, Any]) -> RunConfig:
         milestone=snapshot.get("milestone"),
         initial_task_file=Path(snapshot["initial_task_file"]) if snapshot.get("initial_task_file") else None,
         auto_resume_on_usage_reset=snapshot.get("auto_resume_on_usage_reset", False),
+        token_budget_mode=snapshot.get("token_budget_mode", "legacy_hard_limit"),
         checks=tuple(Check(c["name"], tuple(c["command"]), Path(c["cwd"]), c["timeout_seconds"],
                            tuple(Path(x) for x in c.get("result_files", [])))
                      for c in snapshot.get("checks", [])),
@@ -893,12 +965,19 @@ async def _enter_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
         turn_id = turns[-1].get("id") if turns else None
         if not turn_id:
             return False
-    paused_goal = (await client.call("thread/goal/set", {"threadId": row["thread_id"],
-                                                          "status": "paused"})).get("goal") or {}
-    now = time.time()
-    store.update_run(run_id, status="usage_wait")
-    store.set_usage_wait(run_id, reason, turn_id, reset_at, next_usage_check(now, reset_at),
-                         paused_goal.get("updatedAt") if isinstance(paused_goal.get("updatedAt"), int) else None)
+    with lifecycle_lock(runtime.root):
+        current = store.get_run(run_id)
+        if current["desired_status"] != "active" or current["milestone_status"] == "review":
+            return True  # A human pause or review won the race.
+        paused_goal = (await client.call("thread/goal/set", {"threadId": row["thread_id"],
+                                                              "status": "paused"})).get("goal") or {}
+        if paused_goal.get("status") != "paused" or not isinstance(paused_goal.get("updatedAt"), int):
+            store.update_run(run_id, status="paused", desired_status="paused",
+                             last_error="native goal pause timestamp unavailable; inspect before resuming")
+            return True
+        now = time.time()
+        store.set_usage_wait(run_id, reason, turn_id, reset_at, next_usage_check(now, reset_at),
+                             paused_goal.get("updatedAt") if isinstance(paused_goal.get("updatedAt"), int) else None)
     store.add_event(run_id, "supervisor/usage_wait_started", {
         "reason": reason, "turn_id": turn_id, "reset_at": reset_at,
         "next_check_at": next_usage_check(now, reset_at), "error_code": error_code,
@@ -913,6 +992,12 @@ async def _poll_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
     row = store.get_run(run_id)
     wait = store.usage_wait(run_id)
     if not wait or wait["state"] not in {"waiting", "dispatching"}:
+        return None
+    if wait["state"] == "dispatching":
+        store.mark_interrupted_work_unknown(run_id)
+        store.update_usage_wait(run_id, state="outcome_unknown", last_error="worker stopped during automatic dispatch")
+        store.update_run(run_id, status="paused", desired_status="paused",
+                         last_error="automatic continuation outcome unknown; resolve control before resuming")
         return None
     if row["desired_status"] != "active" or row["milestone_status"] == "review":
         store.update_usage_wait(run_id, state="cancelled")
@@ -929,33 +1014,66 @@ async def _poll_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
         snapshot = await client.call("account/rateLimits/read", usage_read_params(), timeout=15)
     except (CodexError, asyncio.TimeoutError) as exc:
         checks = wait["checks"] + 1
-        store.update_usage_wait(run_id, state="waiting", checks=checks,
-                                next_check_at=next_usage_check(time.time(), None, checks),
-                                last_error=str(exc))
+        with lifecycle_lock(runtime.root):
+            if store.get_run(run_id)["desired_status"] != "active":
+                return None
+            store.update_usage_wait(run_id, state="waiting", checks=checks,
+                                    next_check_at=next_usage_check(time.time(), None, checks),
+                                    last_error=str(exc))
         store.add_event(run_id, "supervisor/usage_read_error", {"error": str(exc)})
         return None
-    try:
-        allowed, reason, reset_at = rate_limit_state(snapshot)
-        if nonrenewable_limit(snapshot):
-            store.update_usage_wait(run_id, state="blocked", last_error="credit or spend limit")
-            store.update_run(run_id, status="blocked", desired_status="blocked",
-                             last_error="provider credit or spend limit requires human action")
-            return None
-        if allowed is not True:
+    allowed, reason, reset_at = rate_limit_state(snapshot)
+    if allowed is not True:
+        with lifecycle_lock(runtime.root):
+            if store.get_run(run_id)["desired_status"] != "active":
+                return None
+            if nonrenewable_limit(snapshot):
+                store.update_usage_wait(run_id, state="blocked", last_error="credit or spend limit")
+                store.update_run(run_id, status="blocked", desired_status="blocked",
+                                 last_error="provider credit or spend limit requires human action")
+                return None
             checks = wait["checks"] + 1
             next_check = next_usage_check(time.time(), reset_at, checks)
             store.update_usage_wait(run_id, state="waiting", reset_at=reset_at,
                                     next_check_at=next_check, checks=checks,
                                     last_error=None if reason else "ordinary usage permission unavailable")
-            store.add_event(run_id, "supervisor/usage_wait_checked", {
-                "allowed": allowed, "reason": reason, "reset_at": reset_at,
-                "next_check_at": next_check,
-            })
-            return None
+        store.add_event(run_id, "supervisor/usage_wait_checked", {
+            "allowed": allowed, "reason": reason, "reset_at": reset_at,
+            "next_check_at": next_check,
+        })
+        return None
+    try:
         response = await client.call("thread/resume", {"threadId": row["thread_id"],
                                                          "cwd": row["repository"]}, timeout=20)
-        turns = response.get("thread", {}).get("turns", [])
         goal = (await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}
+    except (CodexError, asyncio.TimeoutError) as exc:
+        with lifecycle_lock(runtime.root):
+            if store.get_run(run_id)["desired_status"] == "active":
+                store.update_usage_wait(run_id, next_check_at=time.time() + 300, last_error=str(exc))
+        store.add_event(run_id, "supervisor/usage_read_error", {"error": str(exc)})
+        return None
+
+    with lifecycle_lock(runtime.root):
+        row, wait = store.get_run(run_id), store.usage_wait(run_id)
+        if (not wait or wait["state"] != "waiting" or row["status"] != "usage_wait" or
+                row["desired_status"] != "active" or row["milestone_status"] == "review"):
+            return None
+        if nonrenewable_limit(snapshot):
+            store.update_usage_wait(run_id, state="blocked", last_error="credit or spend limit")
+            store.update_run(run_id, status="blocked", desired_status="blocked",
+                             last_error="provider credit or spend limit requires human action")
+            return None
+        thread = response.get("thread") or {}
+        turns = thread.get("turns", [])
+        native_status = thread.get("status") or {}
+        if not isinstance(native_status, dict):
+            native_status = {}
+        flags = native_status.get("activeFlags", [])
+        if any(flag in {"waitingOnApproval", "waitingOnUserInput"} for flag in flags):
+            store.update_usage_wait(run_id, next_check_at=time.time() + 300,
+                                    last_error="native approval or user input pending")
+            store.add_event(run_id, "supervisor/usage_approval_pending", {})
+            return None
         if goal.get("status") in {"complete", "blocked", "budgetLimited"}:
             store.update_usage_wait(run_id, state="blocked", last_error="native goal is not resumable")
             store.update_run(run_id, status="blocked", desired_status="blocked",
@@ -967,9 +1085,14 @@ async def _poll_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
             store.update_run(run_id, status="paused", desired_status="paused",
                              last_error="native goal changed while waiting; review before resuming")
             return None
+        if goal.get("status") == "paused" and (wait["goal_updated_at"] is None or not isinstance(goal.get("updatedAt"), int)):
+            store.update_usage_wait(run_id, state="blocked", last_error="native pause identity unavailable")
+            store.update_run(run_id, status="paused", desired_status="paused",
+                             last_error="cannot verify native goal was not manually paused")
+            return None
         active = next((t for t in reversed(turns) if t.get("status") == "inProgress"), None)
         if active:
-            if goal.get("status") != "active":
+            if native_status.get("type") != "active" or goal.get("status") != "active":
                 store.update_usage_wait(run_id, state="waiting",
                                         next_check_at=next_usage_check(time.time(), None, wait["checks"]))
                 return None
@@ -978,6 +1101,10 @@ async def _poll_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
             store.add_event(run_id, "supervisor/usage_resumed", {
                 "thread_id": row["thread_id"], "turn_id": active.get("id"), "source": "native"})
             return active.get("id")
+        if not isinstance(native_status, dict) or native_status.get("type") != "idle":
+            store.update_usage_wait(run_id, next_check_at=time.time() + 300,
+                                    last_error="native thread is not confirmed idle")
+            return None
         if not turns or not wait["turn_id"] or turns[-1].get("id") != wait["turn_id"]:
             store.update_usage_wait(run_id, state="blocked", last_error="thread advanced while waiting")
             store.update_run(run_id, status="blocked", desired_status="blocked",
@@ -988,22 +1115,27 @@ async def _poll_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
             store.update_run(run_id, status="paused", desired_status="paused",
                              last_error="elapsed-time budget exhausted during usage wait")
             return None
-        store.update_usage_wait(run_id, state="dispatching")
-        turn_id = await runtime.activate(client, run_id, config,
-            "Provider usage is available again. Continue the existing objective from saved state. "
-            "Inspect completed actions and artifacts before retrying any operation.",
-            origin="automatic")
+        control_id = store.claim_usage_dispatch(run_id)
+        if not control_id:
+            return None
+        try:
+            turn_id = await runtime.activate(client, run_id, config,
+                "Provider usage is available again. Continue the existing objective from saved state. "
+                "Inspect completed actions and artifacts before retrying any operation.",
+                origin="automatic")
+        except (CodexError, asyncio.TimeoutError, ValueError) as exc:
+            store.update_control(control_id, "outcome_unknown", str(exc))
+            store.update_usage_wait(run_id, state="outcome_unknown", last_error=str(exc))
+            store.update_run(run_id, status="paused", desired_status="paused",
+                             last_error="automatic continuation outcome unknown; resolve control before resuming")
+            store.add_event(run_id, "supervisor/usage_resume_uncertain", {"control_id": control_id, "error": str(exc)})
+            return None
+        store.update_control(control_id, "confirmed", "automatic continuation acknowledged")
         store.update_usage_wait(run_id, state="resumed", last_error=None)
+        store.release_waiting_controls(run_id)
         store.add_event(run_id, "supervisor/usage_resumed", {
             "thread_id": row["thread_id"], "turn_id": turn_id, "source": "supervisor"})
         return turn_id
-    except (CodexError, asyncio.TimeoutError) as exc:
-        # An acknowledgement can be lost after turn/start. Never blindly send a
-        # second model turn; reconciliation after restart inspects native turns.
-        store.update_usage_wait(run_id, state="dispatching", last_error=str(exc),
-                                next_check_at=time.time() + 300)
-        store.add_event(run_id, "supervisor/usage_resume_uncertain", {"error": str(exc)})
-        return None
 
 
 async def run_worker(root: Path, run_id: str) -> None:
@@ -1046,7 +1178,7 @@ async def run_worker(root: Path, run_id: str) -> None:
                 row = store.get_run(run_id)
                 for control in store.pending_controls(run_id):
                     kind, payload = control["kind"], control["payload"]
-                    if kind in {"send", "queue"} and row["desired_status"] in {"paused", "blocked"}:
+                    if kind in {"send", "queue"} and (row["desired_status"] in {"paused", "blocked"} or row["status"] == "usage_wait"):
                         store.update_control(control["id"], "waiting_resume", "delivery waits for an explicit resume")
                         continue
                     store.update_control(control["id"], "dispatched")
@@ -1192,6 +1324,16 @@ async def run_worker(root: Path, run_id: str) -> None:
                                     "token_warning_threshold": row["token_budget"] or None,
                                 })
                             store.warn_token_usage(run_id)
+                            if (config.token_budget_mode == "legacy_hard_limit" and
+                                    total_tokens >= row["token_budget"] and row["status"] == "active"):
+                                await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
+                                if active_turn and active_turn != "pending":
+                                    await client.call("turn/interrupt", {"threadId": row["thread_id"], "turnId": active_turn})
+                                store.update_run(run_id, status="paused", desired_status="paused",
+                                                 last_error="legacy token budget reached")
+                                store.add_event(run_id, "supervisor/token_budget_reached", {
+                                    "tokens_used": total_tokens, "token_budget": row["token_budget"],
+                                })
                         if status == "paused" and row["status"] == "active" and not active_turn:
                             store.update_run(run_id, status="paused", desired_status="paused",
                                              last_error="native goal paused; inspect progress before resuming")
@@ -1240,7 +1382,9 @@ async def run_worker(root: Path, run_id: str) -> None:
                                     store.add_event(run_id, "supervisor/goal_completed", {"checks": outcomes})
                                     if final_status in {"complete", "validation_failed"}:
                                         return
-                        elif status in {"usageLimited", "budgetLimited", "blocked"} and row["status"] not in {"complete", "stopped", "usage_wait"}:
+                        elif (status in {"usageLimited", "budgetLimited", "blocked"} and
+                              row["status"] not in {"complete", "stopped", "usage_wait"} and
+                              row["desired_status"] == "active"):
                             if status != "usageLimited" or not await _enter_usage_wait(
                                     runtime, client, run_id, config, active_turn):
                                 _record_goal_limited(store, run_id, row, status)
@@ -1293,7 +1437,8 @@ async def run_worker(root: Path, run_id: str) -> None:
                         for control in store.controls(run_id):
                             if control["kind"] == "pause" and control["status"] == "awaiting_ack":
                                 store.update_control(control["id"], "confirmed", "active turn ended")
-                    store.release_waiting_controls(run_id)
+                    if current["status"] == "active" and current["desired_status"] == "active":
+                        store.release_waiting_controls(run_id)
                 elif method.endswith("requestApproval") or method == "item/tool/requestUserInput":
                     store.add_event(run_id, "supervisor/approval_pending", {
                         "method": method, "request_id": params.get("request_id"),

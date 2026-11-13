@@ -2,6 +2,10 @@
 
 # M0 live verification
 
+This is a historical verification record. Its version, token-budget and
+approval observations describe the original M0 tests; use the current
+[operations guide](operations.md) for present behavior.
+
 Date: 2026-10-29
 Scope: generic Codex supervisor only. No M1 work or simulator runs.
 

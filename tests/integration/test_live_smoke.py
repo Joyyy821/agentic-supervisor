@@ -39,21 +39,29 @@ class LiveSmokeTests(unittest.TestCase):
             "version": 1, "project": "python-smoke", "repository": str(fixture),
             "objective": "Create greeting.py with a main function that prints exactly hello supervisor. "
                          "Do not change README.md.",
-            "token_budget": token_budget, "time_budget_seconds": 600,
+            "token_warning_threshold": token_budget, "time_budget_seconds": 600,
             "checks": [{"name": "greeting", "command": ["python3", "-c",
                         "import subprocess,sys; p=subprocess.run([sys.executable,'greeting.py'],capture_output=True,text=True); "
                         "assert p.returncode==0 and p.stdout.strip()=='hello supervisor'"], "timeout_seconds": 20}]
         }), encoding="utf-8")
         runtime = Runtime(runtime_root)
         run_id = __import__("asyncio").run(runtime.start(load_config(config_path, runtime_root)))
-        deadline = time.monotonic() + 610
-        while time.monotonic() < deadline:
-            row = runtime.store.get_run(run_id)
-            if row["status"] in {"complete", "validation_failed", "blocked"}:
-                break
-            time.sleep(2)
-        self.assertEqual(runtime.store.get_run(run_id)["status"], "complete")
-        self.assertTrue((fixture / "greeting.py").is_file())
+        try:
+            deadline = time.monotonic() + 610
+            while time.monotonic() < deadline:
+                row = runtime.store.get_run(run_id)
+                if row["status"] in {"complete", "validation_failed", "blocked", "paused"}:
+                    break
+                if row["tokens_used"] >= token_budget:
+                    runtime.submit(run_id, "pause")
+                    self.fail("smoke-test token allowance reached; owned run paused")
+                time.sleep(2)
+            self.assertEqual(runtime.store.get_run(run_id)["status"], "complete")
+            self.assertTrue((fixture / "greeting.py").is_file())
+        finally:
+            # This session belongs only to the disposable test. Do not leave it
+            # running after a timeout or assertion failure.
+            runtime.submit(run_id, "stop")
 
 
 if __name__ == "__main__":

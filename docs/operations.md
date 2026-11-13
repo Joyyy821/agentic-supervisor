@@ -46,6 +46,56 @@ Budget and milestone updates require confirmed pause and no uncertain operations
 
 Assign a new milestone generation even when revising the same milestone name. This explicitly authorizes new work and validation attempts. Configuration is snapshotted at run creation: editing the original JSON does not update a live run. Use durable controls for milestone and budget changes.
 
+## Changing policy on an existing run
+
+Do this only during a coordinated maintenance pause. It changes the existing
+run, not its thread. Record `status`, the thread ID, milestone, pending
+controls, native goal and current token use. Confirm external commands are
+finished and the TUI has no approval or user-input request. Resolve uncertain
+controls/attempts first. Do not apply these steps to an active agent merely to
+install this version.
+
+For the previously recorded Agentic MAPF runtime, the procedure is shown
+below. The last read-only supervisor ledger inspected during this review still
+reported this run at M1a/review; do not assume it is the session running M2a.
+Confirm the intended runtime and thread with the operator before applying the
+commands to any run.
+
+```sh
+cd /home/yangjiao/workspace/agentic-supervisor
+source .runtime/agentic-supervisor/bin/activate
+export AGENTIC_SUPERVISOR_HOME=/data/yangjiao/agentic-supervisor/amapf
+RUN=b0b92d1f-958e-4e3b-b65c-ddc91876c311
+agentic-supervisor status "$RUN"
+# If active and authorized to pause: agentic-supervisor pause "$RUN"
+# Wait for status=paused and desired_status=paused before continuing.
+tmux -S "$AGENTIC_SUPERVISOR_HOME/supervisor.tmux" list-panes \
+  -t "asup-$RUN:supervisor" -F '#{pane_id} #{pane_dead} #{pane_current_command}'
+# Only after confirming this is the owned worker pane:
+tmux -S "$AGENTIC_SUPERVISOR_HOME/supervisor.tmux" kill-pane -t "asup-$RUN:supervisor.0"
+agentic-supervisor policy "$RUN" --unbound-tokens --auto-resume on
+agentic-supervisor recover "$RUN"
+agentic-supervisor status "$RUN"
+```
+
+`policy` requires Codex 0.166.0, the worker pane stopped, a confirmed paused
+ledger, no uncertain operations, and an idle native thread with a paused or
+completed goal. It refuses a pending approval. It transactionally records the
+change and keeps the run/thread IDs, token totals, milestone, and queued
+instructions. The old token limit becomes an advisory warning threshold; the
+original per-run `config.json` remains the creation snapshot, while SQLite's
+configuration and migration event are authoritative for recovery. The native
+token cap is removed on the **next authorized resume**, not by the `policy`
+command. At a milestone review, assign the next milestone before resuming;
+do not bypass that gate. After recovery verify the same thread and expected
+policy in status, then resume only when work is authorized. The cap removal
+was verified against an isolated 0.166.0 App Server with no model call.
+
+Do not restart an older worker on the migrated run: old supervisor code ignores
+the new mode and can reapply a token cap. `policy RUN --auto-resume off`
+disables automatic recovery using the same paused/idle/worker-stopped checks.
+The existing active-time limit, sandbox and approval policies do not change.
+
 ## Approvals and sandbox
 
 Project JSON supports `approval_policy` (`on-request`, or the legacy `untrusted` where supported), `approvals_reviewer` (`user` or `auto_review`), and `sandbox_mode` (`workspace-write` by default, optionally `read-only`). Do not use `never` or full access. The project repository, run artifacts, and explicit external `artifact_paths` are writable under workspace-write. The private runtime and credentials must not overlap external artifact directories.
@@ -63,6 +113,6 @@ agentic-supervisor resolve RUN_ID CONTROL_ID --type control --outcome not_applie
 
 Recover only after the owned worker exits. Recovery reconnects to surviving App Server state or restarts its owned pane and resumes the recorded thread. It preserves pause intent, checks budgets, and never creates a replacement conversation. Dispatched controls, interrupted checks, and observed unfinished native effects after server loss remain uncertain until evidence resolves them. Resolution does not retry work. Recent paginated native history is used for reconciliation; complete conversation history remains in Codex.
 
-By default, capacity, quota, authentication, denied approvals and protocol errors may halt progress. To wait for a temporary provider usage reset on a **new** Codex 0.166.0 run, set `"auto_resume_on_usage_reset": true` in project JSON. Status exposes `usage_wait.state`, `reset_at`, `next_check_at` and poll count; `events` records provider wait/resume. The worker makes no model call until `account/rateLimits/read` explicitly reports ordinary usage allowed. `pause RUN_ID` cancels the wait; a manual milestone review, completed run, unresolved effect or approval block cannot auto-continue. Missing provider permission stays waiting with spaced polls. Billing/credit depletion is not an automatic retry case. No reset credits are consumed, and no purchase or reserve model fallback is attempted. Pending approvals stay in the native TUI. Detached external experiments still require process/output inspection.
+By default, capacity, quota, authentication, denied approvals and protocol errors may halt progress. To wait for a temporary provider usage reset on a **new** Codex 0.166.0 run, set `"auto_resume_on_usage_reset": true` in project JSON. Status exposes `usage_wait.state`, `reset_at`, `next_check_at` and poll count; `events` records provider wait/resume. The worker makes no model call until `account/rateLimits/read` explicitly reports ordinary usage allowed. `pause RUN_ID` cancels the wait; a manual milestone review, completed run, unresolved effect or approval block cannot auto-continue. A pause issued through the supervisor is serialized with dispatch; simultaneous independent TUI actions cannot be made atomic with that dispatch. If a continuation acknowledgement is lost, resolve the recorded `auto_resume` control using evidence before an explicit resume. Missing provider permission stays waiting with spaced polls. Billing/credit depletion is not an automatic retry case. No reset credits are consumed, and no purchase or reserve model fallback is attempted. Pending approvals stay in the native TUI. Detached external experiments still require process/output inspection.
 
 `agentic-supervisor stop RUN_ID` ends the owned runtime and retains its records. Use `pause` when you intend to continue the same project tomorrow. If the entire tmux server is lost, M0 recovery does not automatically reconstruct all processes; preserve the runtime and Codex home for manual recovery.

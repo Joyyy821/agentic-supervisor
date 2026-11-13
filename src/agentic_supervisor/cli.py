@@ -58,6 +58,10 @@ def parser() -> argparse.ArgumentParser:
     budget.add_argument("run_id")
     budget.add_argument("--add-tokens", type=int, default=0)
     budget.add_argument("--add-seconds", type=int, default=0)
+    policy = commands.add_parser("policy", help="migrate policy on an idle, paused run with its worker stopped")
+    policy.add_argument("run_id")
+    policy.add_argument("--unbound-tokens", action="store_true")
+    policy.add_argument("--auto-resume", choices=["on", "off"])
     milestone = commands.add_parser("milestone", help="assign the next milestone to a paused project")
     milestone.add_argument("run_id")
     milestone.add_argument("name")
@@ -208,10 +212,13 @@ def main(argv: list[str] | None = None) -> int:
     runtime = Runtime(root, args.codex)
     if args.command == "list":
         for row in runtime.store.list_runs():
+            advisory = json.loads(row["config_json"]).get("token_budget_mode") == "advisory"
             print(json.dumps({"id": row["id"], "project": row["project"], "status": row["status"],
                               "desired_status": row["desired_status"], "thread_id": row["thread_id"],
                               "tokens_used": row["tokens_used"],
-                              "token_warning_threshold": row["token_budget"] or None,
+                              "token_policy": "advisory" if advisory else "legacy_hard_limit",
+                              "token_warning_threshold": (row["token_budget"] or None) if advisory else None,
+                              "legacy_token_budget": None if advisory else row["token_budget"],
                               "created_at": row["created_at"]}))
         return 0
     if args.command == "status":
@@ -229,6 +236,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "budget":
         runtime.store.extend_budget(args.run_id, args.add_tokens, args.add_seconds)
+        _print_status(runtime, args.run_id)
+        return 0
+    if args.command == "policy":
+        runtime.migrate_policy(args.run_id, args.unbound_tokens,
+                               None if args.auto_resume is None else args.auto_resume == "on")
         _print_status(runtime, args.run_id)
         return 0
     if args.command == "milestone":

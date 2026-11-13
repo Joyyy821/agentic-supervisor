@@ -62,6 +62,14 @@ class ProtocolContractTests(unittest.TestCase):
                     })
                     goal = await clients[1].call("thread/goal/get", {"threadId": thread_id})
                     self.assertEqual(goal["goal"]["status"], "paused")
+                    self.assertEqual(goal["goal"]["tokenBudget"], 100)
+                    await clients[0].call("thread/goal/set", {
+                        "threadId": thread_id, "tokenBudget": None, "origin": "user",
+                    })
+                    goal = await clients[1].call("thread/goal/get", {"threadId": thread_id})
+                    self.assertIsNone(goal["goal"]["tokenBudget"], "explicit null must remove an existing cap")
+                    thread = await clients[1].call("thread/read", {"threadId": thread_id, "includeTurns": False})
+                    self.assertEqual(thread["thread"]["status"]["type"], "idle")
                 finally:
                     if thread_id and clients:
                         try:

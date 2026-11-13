@@ -48,6 +48,7 @@ class RunConfig:
     milestone: dict[str, str] | None = None
     initial_task_file: Path | None = None
     auto_resume_on_usage_reset: bool = False
+    token_budget_mode: str = "advisory"
 
     def safe_snapshot(self) -> dict[str, Any]:
         return {
@@ -67,7 +68,7 @@ class RunConfig:
             "reasoning_effort": self.reasoning_effort,
             "approval_policy": self.approval_policy,
             "token_budget": self.token_budget,
-            "token_budget_mode": "advisory",
+            "token_budget_mode": self.token_budget_mode,
             "auto_resume_on_usage_reset": self.auto_resume_on_usage_reset,
             "time_budget_seconds": self.time_budget_seconds,
             "environment_allowlist": list(self.environment_allowlist),

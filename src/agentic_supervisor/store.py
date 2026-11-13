@@ -83,6 +83,7 @@ class Store:
                     reason TEXT NOT NULL,
                     turn_id TEXT,
                     goal_updated_at INTEGER,
+                    dispatch_control_id TEXT,
                     reset_at REAL,
                     next_check_at REAL NOT NULL,
                     checks INTEGER NOT NULL DEFAULT 0,
@@ -97,6 +98,8 @@ class Store:
             wait_columns = {row[1] for row in db.execute("PRAGMA table_info(usage_waits)")}
             if "goal_updated_at" not in wait_columns:
                 db.execute("ALTER TABLE usage_waits ADD COLUMN goal_updated_at INTEGER")
+            if "dispatch_control_id" not in wait_columns:
+                db.execute("ALTER TABLE usage_waits ADD COLUMN dispatch_control_id TEXT")
             if "tokens_used" not in columns:
                 db.execute("ALTER TABLE runs ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0")
             if "native_tokens_seen" not in columns:
@@ -230,11 +233,30 @@ class Store:
             db.execute("INSERT INTO usage_waits(run_id,state,reason,turn_id,goal_updated_at,reset_at,next_check_at,updated_at) "
                        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET "
                        "state='waiting',reason=excluded.reason,turn_id=excluded.turn_id,"
-                       "goal_updated_at=excluded.goal_updated_at,reset_at=excluded.reset_at,"
+                       "goal_updated_at=excluded.goal_updated_at,dispatch_control_id=NULL,checks=0,last_error=NULL,reset_at=excluded.reset_at,"
                        "next_check_at=excluded.next_check_at,updated_at=excluded.updated_at",
                        (run_id, "waiting", reason, turn_id, goal_updated_at, reset_at, next_check_at, time.time()))
-            db.execute("UPDATE runs SET status='usage_wait',last_error=? WHERE id=?",
-                       (f"Codex provider usage limit: {reason}", run_id))
+            row = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            db.execute("UPDATE runs SET status='usage_wait',last_error=?,elapsed_seconds=?,active_since=NULL WHERE id=?",
+                       (f"Codex provider usage limit: {reason}", self.elapsed(row), run_id))
+
+    def claim_usage_dispatch(self, run_id: str) -> str | None:
+        """Atomically record automatic dispatch before any native mutation."""
+        now, control_id = time.time(), str(uuid.uuid4())
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            wait = db.execute("SELECT * FROM usage_waits WHERE run_id=?", (run_id,)).fetchone()
+            if (not row or not wait or row["status"] != "usage_wait" or
+                    row["desired_status"] != "active" or row["milestone_status"] == "review" or
+                    wait["state"] != "waiting"):
+                return None
+            if db.execute("SELECT 1 FROM controls WHERE run_id=? AND status IN ('dispatched','outcome_unknown','awaiting_ack')", (run_id,)).fetchone() or db.execute("SELECT 1 FROM attempts WHERE run_id=? AND status IN ('running','outcome_unknown')", (run_id,)).fetchone():
+                return None
+            db.execute("INSERT INTO controls(id,run_id,kind,payload,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                       (control_id, run_id, "auto_resume", "", "dispatched", now, now))
+            db.execute("UPDATE usage_waits SET state='dispatching',dispatch_control_id=?,updated_at=? WHERE run_id=?",
+                       (control_id, now, run_id))
+        return control_id
 
     def update_usage_wait(self, run_id: str, **fields: Any) -> None:
         if not fields or set(fields) - {"state", "reset_at", "next_check_at", "checks", "last_error"}:
@@ -409,6 +431,29 @@ class Store:
                        "tokens_used": row["tokens_used"], "elapsed_seconds": self.elapsed(row)}
             db.execute("INSERT INTO events(run_id,kind,payload_json,created_at) VALUES(?,?,?,?)",
                        (run_id, "supervisor/budget_extended", json.dumps(payload), time.time()))
+
+    def migrate_policy(self, run_id: str, unbound_tokens: bool, auto_resume: bool | None) -> None:
+        if not unbound_tokens and auto_resume is None:
+            raise ValueError("choose --unbound-tokens and/or --auto-resume")
+        with self.connect() as db:
+            row = self.require_paused(db, run_id)
+            if auto_resume and row["codex_version"] != "codex-cli 0.166.0":
+                raise ValueError("automatic usage recovery requires Codex 0.166.0")
+            config = json.loads(row["config_json"])
+            previous = {"token_budget_mode": config.get("token_budget_mode", "legacy_hard_limit"),
+                        "auto_resume_on_usage_reset": config.get("auto_resume_on_usage_reset", False)}
+            if unbound_tokens:
+                config["token_budget_mode"] = "advisory"
+                config["token_budget"] = row["token_budget"] or None
+            if auto_resume is not None:
+                config["auto_resume_on_usage_reset"] = auto_resume
+            db.execute("UPDATE runs SET config_json=? WHERE id=?", (json.dumps(config, sort_keys=True), run_id))
+            db.execute("INSERT INTO events(run_id,kind,payload_json,created_at) VALUES(?,?,?,?)", (
+                run_id, "supervisor/policy_migrated", json.dumps({"previous": previous,
+                    "token_budget_mode": config.get("token_budget_mode", "legacy_hard_limit"),
+                    "auto_resume_on_usage_reset": config.get("auto_resume_on_usage_reset", False),
+                    "token_warning_threshold": row["token_budget"] or None,
+                    "thread_id": row["thread_id"], "tokens_used": row["tokens_used"]}), time.time()))
 
     def set_milestone(self, run_id: str, name: str, objective: str) -> None:
         from .config import validate_milestone
