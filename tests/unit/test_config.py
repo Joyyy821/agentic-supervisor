@@ -29,6 +29,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.token_budget, 30000)
         self.assertEqual(config.safe_snapshot()["project"], "plain-python")
 
+    def test_unbounded_tokens_and_opt_in_usage_recovery(self) -> None:
+        self.data.pop("token_budget")
+        config = self.load(token_warning_threshold=None, auto_resume_on_usage_reset=True)
+        self.assertIsNone(config.token_budget)
+        self.assertTrue(config.auto_resume_on_usage_reset)
+        self.assertEqual(config.safe_snapshot()["token_budget_mode"], "advisory")
+        with self.assertRaises(ConfigError):
+            self.load(token_warning_threshold=50000, token_budget=30000)
+
     def test_rejects_non_git_repository(self) -> None:
         outside = test_root() / f"plain-{uuid.uuid4()}"
         outside.mkdir()

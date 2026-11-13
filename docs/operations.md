@@ -34,15 +34,15 @@ agentic-supervisor resume RUN_ID
 
 Set `milestone: {"name":"audit","objective":"Inspect and propose a design"}` to keep the project alive after its first goal. The top-level objective describes the project; the milestone objective bounds the currently authorized work. At milestone completion, configured checks run once per milestone generation, artifacts are hashed, and the project pauses for review. The same thread and native TUI remain available.
 
-After reviewing findings, explicitly assign the next milestone and budget, then resume:
+After reviewing findings, explicitly assign the next milestone and, if needed, extend elapsed time before resuming:
 
 ```sh
-agentic-supervisor budget RUN_ID --add-tokens 80000 --add-seconds 7200
+agentic-supervisor budget RUN_ID --add-seconds 7200
 agentic-supervisor milestone RUN_ID implementation --objective "Implement the reviewed proposal and verify its acceptance criteria."
 agentic-supervisor resume RUN_ID
 ```
 
-Budget and milestone updates require confirmed pause and no uncertain operations. Budget changes add to cumulative limits and are recorded in the event ledger; they do not erase usage. A milestone transition records prior-stage usage and starts a new stage baseline. An exhausted budget pauses the project and requires an explicit extension. Active elapsed time includes worker outages while execution was active, but excludes confirmed review pauses. Native goal token accounting is reconciled from returned counters, whose reset behavior differs by release. Limits are operational bounds, not exact billing caps; enforcement can be delayed while the worker is unavailable.
+Budget and milestone updates require confirmed pause and no uncertain operations. A milestone transition records prior-stage usage and starts a new stage baseline. New runs have no project token cap; `token_warning_threshold` (or legacy `token_budget`) only warns. `budget --add-tokens` can raise an existing warning threshold, while `--add-seconds` extends the enforced active-time limit. Active elapsed time includes worker outages while execution was active, but excludes confirmed review pauses and provider usage waits. Native token counters remain the accounting source. Time enforcement can be delayed while the worker is unavailable.
 
 Assign a new milestone generation even when revising the same milestone name. This explicitly authorizes new work and validation attempts. Configuration is snapshotted at run creation: editing the original JSON does not update a live run. Use durable controls for milestone and budget changes.
 
@@ -63,6 +63,6 @@ agentic-supervisor resolve RUN_ID CONTROL_ID --type control --outcome not_applie
 
 Recover only after the owned worker exits. Recovery reconnects to surviving App Server state or restarts its owned pane and resumes the recorded thread. It preserves pause intent, checks budgets, and never creates a replacement conversation. Dispatched controls, interrupted checks, and observed unfinished native effects after server loss remain uncertain until evidence resolves them. Resolution does not retry work. Recent paginated native history is used for reconciliation; complete conversation history remains in Codex.
 
-Capacity, quota, authentication, denied approvals and protocol errors may halt progress. Inspect the TUI and status, correct the cause, then explicitly resume a paused run. No automatic retry of side-effectful operations is promised. Pending approvals do not terminate the project. Detached external experiments still require process/output inspection.
+By default, capacity, quota, authentication, denied approvals and protocol errors may halt progress. To wait for a temporary provider usage reset on a **new** Codex 0.166.0 run, set `"auto_resume_on_usage_reset": true` in project JSON. Status exposes `usage_wait.state`, `reset_at`, `next_check_at` and poll count; `events` records provider wait/resume. The worker makes no model call until `account/rateLimits/read` explicitly reports ordinary usage allowed. `pause RUN_ID` cancels the wait; a manual milestone review, completed run, unresolved effect or approval block cannot auto-continue. Missing provider permission stays waiting with spaced polls. Billing/credit depletion is not an automatic retry case. No reset credits are consumed, and no purchase or reserve model fallback is attempted. Pending approvals stay in the native TUI. Detached external experiments still require process/output inspection.
 
 `agentic-supervisor stop RUN_ID` ends the owned runtime and retains its records. Use `pause` when you intend to continue the same project tomorrow. If the entire tmux server is lost, M0 recovery does not automatically reconstruct all processes; preserve the runtime and Codex home for manual recovery.

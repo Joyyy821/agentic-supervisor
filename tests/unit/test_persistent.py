@@ -56,10 +56,11 @@ class PersistentTests(unittest.TestCase):
         with patch('agentic_supervisor.store.time.time',return_value=1000):
             self.assertEqual(self.rt.store.elapsed(self.rt.store.get_run(self.run)),10)
 
-    def test_budget_exhaustion_requires_explicit_extension(self):
+    def test_token_threshold_warns_without_blocking_resume(self):
         self.rt.store.observe_token_usage(self.run,100)
-        with self.assertRaises(Exception): self.rt.submit(self.run,'resume')
-        self.rt.store.extend_budget(self.run,50,0)
+        self.rt.store.warn_token_usage(self.run)
+        self.rt.store.warn_token_usage(self.run)
+        self.assertEqual(len([e for e in self.rt.store.events(self.run) if e['kind']=='supervisor/token_warning']),1)
         self.rt.submit(self.run,'resume')
 
     def test_repeated_native_goal_limit_poll_is_idempotent(self):
@@ -82,7 +83,7 @@ class PersistentTests(unittest.TestCase):
         self.path.write_text(json.dumps(data | {'artifact_paths':[str(self.root)]}))
         with self.assertRaises(ConfigError):load_config(self.path)
 
-    def test_activate_restores_remaining_native_budget_on_same_thread(self):
+    def test_activate_uses_unbounded_native_goal_on_same_thread(self):
         async def scenario():
             self.rt.store.observe_token_usage(self.run,20)
             client=AsyncMock()
@@ -91,7 +92,7 @@ class PersistentTests(unittest.TestCase):
             turn=await self.rt.activate(client,self.run,self.cfg,'Continue')
             self.assertEqual(turn,'next-turn')
             args=client.call.call_args_list[1].args[1]
-            self.assertEqual(args['threadId'],'same-thread');self.assertEqual(args['tokenBudget'],100)
+            self.assertEqual(args['threadId'],'same-thread');self.assertIsNone(args['tokenBudget'])
             self.assertEqual(args['origin'],'user')
             self.assertEqual(client.call.call_args_list[2].args[1]['sandboxPolicy']['type'],'workspaceWrite')
         asyncio.run(scenario())
@@ -117,7 +118,7 @@ class PersistentTests(unittest.TestCase):
             client.call.side_effect=[{'goal':{'objective':'old goal','tokensUsed':20,'status':'complete'}},
                                      {'goal':{'tokensUsed':0}}, {}, {'turn':{'id':'new'}}, {}]
             await self.rt.activate(client,self.run,self.cfg,'next stage')
-            self.assertEqual(client.call.call_args_list[2].args[1]['tokenBudget'],80)
+            self.assertIsNone(client.call.call_args_list[1].args[1]['tokenBudget'])
             self.assertEqual(self.rt.store.get_run(self.run)['native_tokens_seen'],0)
             self.rt.store.observe_token_usage(self.run,5)
             self.assertEqual(self.rt.store.get_run(self.run)['tokens_used'],25)

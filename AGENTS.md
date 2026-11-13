@@ -33,4 +33,4 @@ Agentic MAPF is one optional application. Keep its assumptions and `AMAPF-M*` mi
 
 Run unit tests with `python3 -m unittest discover -s tests/unit -v`. Put live-runtime tests behind an explicit opt-in and use a newly initialized nonrobotics repository. Store all generated test data under a unique directory inside the configured runtime test root. Verify that `mas-vln` remains unchanged.
 
-Persistent project changes must preserve thread identity, cumulative accounting, uncertain-operation guards, and paused review states. Validate exact Codex releases before extending the version allowlist. Keep runtime credentials outside external artifact roots.
+Persistent project changes must preserve thread identity, cumulative accounting, uncertain-operation guards, and paused review states. Token warnings must never interrupt a run; provider usage recovery is opt-in and requires explicit provider availability. Never consume reset credits, purchase credits, or start a duplicate turn to work around quota. Validate exact Codex releases before extending the version allowlist. Keep runtime credentials outside external artifact roots.

@@ -65,7 +65,8 @@ Copy `examples/generic-project.json` and set the repository, objective, and runt
   "approvals_reviewer": "auto_review",
   "sandbox_mode": "workspace-write",
   "context_files": [],
-  "token_budget": 100000,
+  "token_warning_threshold": 100000,
+  "auto_resume_on_usage_reset": false,
   "time_budget_seconds": 7200,
   "checks": []
 }
@@ -110,12 +111,14 @@ The target repository is writable only under Codex's configured sandbox and appr
 A `milestone` object enables a persistent project. The overarching `objective` remains in thread context while the native goal tracks the current milestone. Completion runs checks and pauses for human review, retaining the same thread, worker and TUI. Configurations without a milestone retain one-task completion behavior.
 
 ```sh
-agentic-supervisor budget RUN_ID --add-tokens 80000 --add-seconds 7200
+agentic-supervisor budget RUN_ID --add-seconds 7200
 agentic-supervisor milestone RUN_ID implementation --objective "Implement the reviewed design and run its acceptance checks."
 agentic-supervisor resume RUN_ID
 ```
 
-These changes require a confirmed paused run. Budget extensions are explicit, additive, and recorded; they never reset cumulative usage. Status reports cumulative and current-milestone usage. Time limits count active execution, including worker downtime while active; review pauses do not consume time. Resolve uncertain operations before resuming. Use `pause` for overnight breaks; `stop` ends the run.
+Token accounting is cumulative, with current-milestone usage in `status`. `token_warning_threshold` is optional and only emits warnings at each multiple; omitting it leaves the native goal unbounded by project token caps and emits a warning every 100,000 tokens. Legacy `token_budget` in a new configuration is accepted as an advisory threshold. The native goal receives `tokenBudget: null`. `budget --add-tokens` raises an existing advisory threshold; it does not impose a hard cap. The elapsed-time limit remains enforced and can be extended while confirmed paused. Review pauses do not consume active time. Resolve uncertain operations before resuming. Use `pause` for overnight breaks; `stop` ends the run.
+
+Set `auto_resume_on_usage_reset: true` to opt into provider usage recovery on Codex CLI 0.166.0. On a structured temporary usage limit, the worker pauses the goal, retains the thread and polls `account/rateLimits/read` after the reported reset or on a bounded 5–60 minute schedule. It sends no model requests while waiting. It continues only when the provider explicitly reports `ordinaryUsageAllowed: true` and no manual pause, review gate, uncertain operation or approval block is present. `status` shows the wait and next check; `events` records polling and recovery. `pause RUN_ID` cancels the wait. Credits, purchases, reserve model fallback and approval bypass are never automatic. A configuration snapshot is fixed at run creation, so enable this for **new runs**; adopting a new installed package into an active run requires a coordinated worker restart and review.
 
 `initial_task_file` supplies a complete initial task (UTF-8, at most 128 KiB) alongside the overarching objective. `artifact_paths` grants narrow external directories through native writable roots. Create those directories first and keep them separate from the private runtime/credentials. `writable_paths` remains restricted to paths inside the checkout. The default sandbox is `workspace-write`; `read-only` is optional. Select an available model and reasoning effort using `doctor --config` before launch; the detached runtime does not inherit the VS Code model selection.
 
@@ -125,7 +128,7 @@ The runtime root contains a private SQLite database, a private Codex home, Unix 
 
 If the worker exits, use `agentic-supervisor recover RUN_ID` to reconnect it to the existing App Server and thread. If the App Server stopped, recovery restarts that owned process against the private Codex home and verifies the stored thread before continuing; the native TUI pane is restarted to attach to the new process. Recovery reconciles saved events and controls before continuing. A command interrupted during a crash can have an unknown outcome; inspect its artifacts and resolve the attempt explicitly instead of blindly repeating it. `resolve` records the operator's outcome and evidence.
 
-M0 supports recovery from SSH disconnection and controlled process interruption. It does not configure reboot autostart, guarantee exactly-once execution of arbitrary external commands, recover a machine failure, or turn a thread resume into proof that an experiment completed. Native token budgets and supervisor elapsed-time limits are operational bounds, not exact billing caps. Authentication expiry, account limits, approval requests, and the experimental App Server protocol can pause progress.
+M0 supports recovery from SSH disconnection and controlled process interruption. It does not configure reboot autostart, guarantee exactly-once execution of arbitrary external commands, recover a machine failure, or turn a thread resume into proof that an experiment completed. The supervisor's elapsed-time limit remains an operational bound, not an exact billing cap. Authentication expiry, non-temporary account limits, approval requests, and the experimental App Server protocol can pause progress. See [usage-policy verification](docs/usage-policy-verification.md).
 
 ## Development
 

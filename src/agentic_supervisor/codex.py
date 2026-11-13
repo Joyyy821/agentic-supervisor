@@ -22,6 +22,7 @@ class CodexError(RuntimeError):
 
 _EVENT_SCALARS = {"id", "type", "status", "method", "code", "threadId", "turnId", "itemId",
                   "requestId", "tokensUsed", "totalTokens", "tokenBudget", "timeUsedSeconds"}
+_EVENT_SCALARS.update({"codexErrorInfo", "rateLimitReachedType", "resetsAt", "ordinaryUsageAllowed"})
 
 
 def _compact_event(value: Any, key: str = "", depth: int = 0) -> Any:

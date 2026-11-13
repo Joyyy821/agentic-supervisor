@@ -38,7 +38,7 @@ class FakeRpc:
 
 
 class MockRuntimeTests(unittest.TestCase):
-    def test_start_creates_thread_then_tui_and_bounded_goal(self):
+    def test_start_creates_thread_then_tui_and_unbounded_goal(self):
         root = test_root() / f"m-{uuid.uuid4().hex[:8]}"
         repo = new_git_repo("generic-python")
         config_path = root / "run.json"
@@ -83,7 +83,7 @@ class MockRuntimeTests(unittest.TestCase):
         self.assertEqual(client1.calls[1][1]["status"], "paused")
         self.assertEqual(client1.calls[2][1]["sandboxPolicy"]["type"], "readOnly")
         self.assertEqual([method for method, _ in client2.calls], ["thread/goal/get", "thread/goal/set", "turn/start", "thread/goal/set"])
-        self.assertEqual(client2.calls[1][1]["tokenBudget"], 30000)
+        self.assertIsNone(client2.calls[1][1]["tokenBudget"])
         self.assertEqual(client2.calls[2][1]["sandboxPolicy"]["type"], "workspaceWrite")
         self.assertIn(str(repo), client2.calls[2][1]["sandboxPolicy"]["writableRoots"])
         self.assertTrue(any("supervisor" in call.args for call in tmux.call_args_list))

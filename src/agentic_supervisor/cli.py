@@ -54,7 +54,7 @@ def parser() -> argparse.ArgumentParser:
     for name in ("pause", "resume", "interrupt", "stop", "recover"):
         item = commands.add_parser(name)
         item.add_argument("run_id")
-    budget = commands.add_parser("budget", help="extend a paused run's cumulative execution limits")
+    budget = commands.add_parser("budget", help="extend a paused run's advisory token threshold or elapsed-time limit")
     budget.add_argument("run_id")
     budget.add_argument("--add-tokens", type=int, default=0)
     budget.add_argument("--add-seconds", type=int, default=0)
@@ -90,9 +90,11 @@ def _doctor(root: Path, runtime: Runtime | None, config=None) -> int:
     try:
         checks["codex"] = awaitable_version(executable)
         checks["codex_supported"] = checks["codex"] in VALIDATED_VERSIONS
+        checks["auto_resume_supported"] = not (config and config.auto_resume_on_usage_reset) or checks["codex"] == "codex-cli 0.166.0"
     except Exception as exc:
         checks["codex_error"] = str(exc)
         checks["codex_supported"] = False
+        checks["auto_resume_supported"] = False
     try:
         checks["tmux"] = subprocess.run(["tmux", "-V"], capture_output=True, text=True,
                                         timeout=5).stdout.strip() or None
@@ -117,7 +119,7 @@ def _doctor(root: Path, runtime: Runtime | None, config=None) -> int:
         checks["protocol_error"] = str(exc)
         checks["protocol_ready"] = False
     checks["private_home_exists"] = home.exists()
-    results["ready"] = bool(checks.get("codex_supported") and checks.get("tmux")
+    results["ready"] = bool(checks.get("codex_supported") and checks.get("auto_resume_supported") and checks.get("tmux")
                              and checks.get("authenticated") and checks.get("protocol_ready"))
     print(json.dumps(results, indent=2))
     return 0 if results["ready"] else 1
@@ -131,6 +133,8 @@ def _print_status(runtime: Runtime, run_id: str) -> None:
     row = runtime.store.get_run(run_id)
     attempts = runtime.store.attempts(run_id)
     checkpoint = runtime.store.latest_event(run_id, "supervisor/git_checkpoint")
+    usage_wait = runtime.store.usage_wait(run_id)
+    config = json.loads(row["config_json"])
     print(json.dumps({
         "id": row["id"], "project": row["project"], "repository": row["repository"],
         "thread_id": row["thread_id"], "status": row["status"],
@@ -138,7 +142,14 @@ def _print_status(runtime: Runtime, run_id: str) -> None:
         "codex_version": row["codex_version"], "git_head": row["git_head"],
         "git_dirty_at_start": bool(row["git_dirty"]), "created_at": row["created_at"],
         "started_at": row["started_at"], "last_error": row["last_error"],
-        "tokens_used": row["tokens_used"], "token_budget": row["token_budget"],
+        "tokens_used": row["tokens_used"],
+        "token_warning_threshold": (row["token_budget"] or None) if config.get("token_budget_mode") == "advisory" else None,
+        "legacy_token_budget": row["token_budget"] if config.get("token_budget_mode") != "advisory" else None,
+        "token_policy": "advisory" if config.get("token_budget_mode") == "advisory" else "legacy_hard_limit",
+        "auto_resume_on_usage_reset": bool(config.get("auto_resume_on_usage_reset", False)),
+        "usage_wait": {key: usage_wait[key] for key in
+                       ("state", "reason", "turn_id", "reset_at", "next_check_at", "checks", "last_error")}
+                      if usage_wait else None,
         "codex_executable": row["codex_executable"],
         "elapsed_seconds": runtime.store.elapsed(row), "time_budget_seconds": row["time_budget_seconds"],
         "milestone": {"name": row["milestone_name"], "objective": row["milestone_objective"],
@@ -199,7 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         for row in runtime.store.list_runs():
             print(json.dumps({"id": row["id"], "project": row["project"], "status": row["status"],
                               "desired_status": row["desired_status"], "thread_id": row["thread_id"],
-                              "tokens_used": row["tokens_used"], "token_budget": row["token_budget"],
+                              "tokens_used": row["tokens_used"],
+                              "token_warning_threshold": row["token_budget"] or None,
                               "created_at": row["created_at"]}))
         return 0
     if args.command == "status":

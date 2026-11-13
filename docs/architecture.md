@@ -1,6 +1,6 @@
 # Architecture
 
-Agentic Supervisor is a general-purpose process and workflow layer around native Codex. Codex owns reasoning, tools, conversation history, compaction and autonomous goal continuation. The supervisor owns durable operator controls, process ownership, provenance, execution budgets and conservative recovery. There is no separate conversation manager or required project adapter.
+Agentic Supervisor is a general-purpose process and workflow layer around native Codex. Codex owns reasoning, tools, conversation history, compaction and autonomous goal continuation. The supervisor owns durable operator controls, process ownership, provenance, token accounting, elapsed-time limits and conservative recovery. There is no separate conversation manager or required project adapter.
 
 ## Runtime and compatibility
 
@@ -8,7 +8,7 @@ One runtime root holds one live project run, its private Codex home, SQLite stat
 
 The explicit validated release list is 0.144.4 and 0.166.0. Unknown releases fail the version gate. Startup also probes authenticated model discovery, two clients and shared paused goal state without a model turn. Each run records the resolved executable and version; recovery uses that executable and checks that its version has not changed.
 
-For 0.166.0, thread resume requests exclude full history and retrieve a bounded page of recent turn summaries through `thread/turns/list`. Full history remains native. Goal mutations distinguish explicit operator authorization from automatic lifecycle actions. The code does not infer token-counter resets from objective changes: it reads the acknowledged native baseline and calibrates the remaining native limit.
+For 0.166.0, thread resume requests exclude full history and retrieve a bounded page of recent turn summaries through `thread/turns/list`. Full history remains native. Goal mutations distinguish explicit operator authorization from automatic lifecycle actions. The code does not infer token-counter resets from objective changes: it reads the acknowledged native baseline. New goals set `tokenBudget: null`; provider and context-window limits still apply.
 
 ## Persistent project lifecycle
 
@@ -18,7 +18,9 @@ Without a milestone, original one-task terminal completion behavior remains supp
 
 SQLite distinguishes desired state from observed state. Controls are recorded before dispatch and become accepted/confirmed or uncertain. Queued input is delivered in order at the next eligible turn, including an explicitly resumed turn. A lost acknowledgement never causes blind replay.
 
-Budgets are cumulative token and active-time ceilings with explicit additive extensions. Stage baselines provide current-stage usage without clearing total usage. Confirmed pauses stop active-time accounting; worker downtime while active is counted. Budget changes and milestone assignments are atomic ledger events and require a paused run with no unresolved operations.
+Token use is cumulative and stage baselines report current-stage use. A configured token threshold is advisory only; warnings are emitted once per crossed multiple. Existing `token_budget` JSON is accepted as a warning threshold for new runs, while pre-upgrade snapshots are labeled legacy in status. The elapsed-time ceiling remains enforced and can be extended explicitly. Confirmed pauses and provider usage waits stop active-time accounting; worker downtime while active is counted. Milestone assignments and extensions are atomic ledger events and require a paused run with no unresolved operations.
+
+Optional provider usage recovery uses Codex 0.166.0's structured turn error, `usageLimited` goal status and `account/rateLimits/read`. Only backend-classified temporary rate/usage windows qualify. The worker stores the failed turn, reset time, next check and attempt count, then polls without model requests. `ordinaryUsageAllowed: true` is required to continue. Before a follow-up, it checks the same thread's recent turns, native goal, manual pause/review intent and unresolved side effects. A lost follow-up acknowledgement stays uncertain; it is never blindly replayed. No earned reset credit is consumed and Luna reserve is disabled. The worker lock and native turn reconciliation prevent duplicate concurrent turns. Manual pause/stop cancels the wait.
 
 ## Permissions and evidence
 

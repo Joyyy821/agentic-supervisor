@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-ACTIVE_STATUSES = ("starting", "active", "pausing", "paused", "recovering", "blocked")
+ACTIVE_STATUSES = ("starting", "active", "pausing", "paused", "recovering", "blocked", "usage_wait")
 
 
 class Store:
@@ -77,11 +77,26 @@ class Store:
                     stderr_path TEXT,
                     result_json TEXT
                 );
+                CREATE TABLE IF NOT EXISTS usage_waits (
+                    run_id TEXT PRIMARY KEY REFERENCES runs(id),
+                    state TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    turn_id TEXT,
+                    goal_updated_at INTEGER,
+                    reset_at REAL,
+                    next_check_at REAL NOT NULL,
+                    checks INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    updated_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS events_by_run ON events(run_id, id);
                 CREATE INDEX IF NOT EXISTS controls_by_run ON controls(run_id, status, created_at);
                 """
             )
             columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
+            wait_columns = {row[1] for row in db.execute("PRAGMA table_info(usage_waits)")}
+            if "goal_updated_at" not in wait_columns:
+                db.execute("ALTER TABLE usage_waits ADD COLUMN goal_updated_at INTEGER")
             if "tokens_used" not in columns:
                 db.execute("ALTER TABLE runs ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0")
             if "native_tokens_seen" not in columns:
@@ -91,6 +106,7 @@ class Store:
                 "milestone_status": "TEXT", "milestone_generation": "INTEGER NOT NULL DEFAULT 0",
                 "stage_token_start": "INTEGER NOT NULL DEFAULT 0", "stage_time_start": "REAL NOT NULL DEFAULT 0",
                 "elapsed_seconds": "REAL NOT NULL DEFAULT 0", "active_since": "REAL",
+                "token_warning_level": "INTEGER NOT NULL DEFAULT 0",
             }
             for name, declaration in additions.items():
                 if name not in columns:
@@ -98,12 +114,12 @@ class Store:
             if "active_since" not in columns:
                 db.execute("UPDATE runs SET active_since=COALESCE(started_at,created_at) WHERE status='active'")
             index = db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='one_live_run'").fetchone()
-            if index and "'pausing'" not in index[0]:
+            if index and ("'pausing'" not in index[0] or "'usage_wait'" not in index[0]):
                 db.execute("DROP INDEX one_live_run")
                 index = None
             if not index:
                 db.execute("CREATE UNIQUE INDEX one_live_run ON runs((1)) "
-                           "WHERE status IN ('starting','active','pausing','paused','recovering','blocked')")
+                           "WHERE status IN ('starting','active','pausing','paused','recovering','blocked','usage_wait')")
 
     def _connect(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -129,7 +145,7 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (run_id, config.project, str(config.repository), session, "starting", "active",
                  config.objective, snapshot, codex_version, git_head, int(git_dirty), now,
-                 config.token_budget, config.time_budget_seconds),
+                 config.token_budget or 0, config.time_budget_seconds),
             )
         if config.milestone:
             self.update_run(run_id, milestone_name=config.milestone["name"],
@@ -171,7 +187,7 @@ class Store:
             if "status" in fields and old:
                 if fields["status"] == "active" and old["active_since"] is None:
                     fields["active_since"] = time.time()
-                elif fields["status"] in {"paused", "blocked", "stopped", "complete", "validation_failed", "failed"} and old["active_since"] is not None:
+                elif fields["status"] in {"paused", "blocked", "usage_wait", "stopped", "complete", "validation_failed", "failed"} and old["active_since"] is not None:
                     fields["elapsed_seconds"] = self.elapsed(old)
                     fields["active_since"] = None
             assignments = ", ".join(f"{key} = ?" for key in fields)
@@ -189,6 +205,53 @@ class Store:
             db.execute("UPDATE runs SET tokens_used=?,native_tokens_seen=? WHERE id=?",
                        (total, native_tokens, run_id))
         return total, delta
+
+    def warn_token_usage(self, run_id: str) -> None:
+        """Emit one advisory warning per threshold crossed, including after recovery."""
+        with self.connect() as db:
+            row = db.execute("SELECT tokens_used,token_budget,token_warning_level FROM runs WHERE id=?", (run_id,)).fetchone()
+            step = row["token_budget"] or 100000
+            level = row["tokens_used"] // step
+            if level <= row["token_warning_level"]:
+                return
+            db.execute("UPDATE runs SET token_warning_level=? WHERE id=?", (level, run_id))
+            db.execute("INSERT INTO events(run_id,kind,payload_json,created_at) VALUES(?,?,?,?)",
+                       (run_id, "supervisor/token_warning", json.dumps({"tokens_used": row["tokens_used"],
+                        "warning_threshold": step, "level": level}), time.time()))
+
+    def usage_wait(self, run_id: str) -> sqlite3.Row | None:
+        with self.connect() as db:
+            return db.execute("SELECT * FROM usage_waits WHERE run_id=?", (run_id,)).fetchone()
+
+    def set_usage_wait(self, run_id: str, reason: str, turn_id: str | None,
+                       reset_at: float | None, next_check_at: float,
+                       goal_updated_at: int | None = None) -> None:
+        with self.connect() as db:
+            db.execute("INSERT INTO usage_waits(run_id,state,reason,turn_id,goal_updated_at,reset_at,next_check_at,updated_at) "
+                       "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET "
+                       "state='waiting',reason=excluded.reason,turn_id=excluded.turn_id,"
+                       "goal_updated_at=excluded.goal_updated_at,reset_at=excluded.reset_at,"
+                       "next_check_at=excluded.next_check_at,updated_at=excluded.updated_at",
+                       (run_id, "waiting", reason, turn_id, goal_updated_at, reset_at, next_check_at, time.time()))
+            db.execute("UPDATE runs SET status='usage_wait',last_error=? WHERE id=?",
+                       (f"Codex provider usage limit: {reason}", run_id))
+
+    def update_usage_wait(self, run_id: str, **fields: Any) -> None:
+        if not fields or set(fields) - {"state", "reset_at", "next_check_at", "checks", "last_error"}:
+            raise ValueError("invalid usage wait fields")
+        fields["updated_at"] = time.time()
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        with self.connect() as db:
+            db.execute(f"UPDATE usage_waits SET {assignments} WHERE run_id=?", (*fields.values(), run_id))
+
+    def unfinished_native_effects(self, run_id: str) -> bool:
+        with self.connect() as db:
+            rows = db.execute("SELECT e.native_id,e.payload_json FROM events e WHERE e.run_id=? "
+                              "AND e.kind='item/started' AND e.native_id IS NOT NULL AND NOT EXISTS "
+                              "(SELECT 1 FROM events c WHERE c.run_id=e.run_id AND c.native_id=e.native_id "
+                              "AND c.kind='item/completed')", (run_id,)).fetchall()
+        return any(json.loads(r["payload_json"]).get("type") in
+                   {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"} for r in rows)
 
     def queue_control(self, run_id: str, kind: str, payload: str) -> str:
         control_id = str(uuid.uuid4())
@@ -338,6 +401,8 @@ class Store:
             raise ValueError("single extension exceeds 10M tokens or seven days")
         with self.connect() as db:
             row = self.require_paused(db, run_id)
+            if tokens and row["token_budget"] == 0:
+                raise ValueError("run has no token warning threshold to extend")
             db.execute("UPDATE runs SET token_budget=token_budget+?, time_budget_seconds=time_budget_seconds+? WHERE id=?", (tokens, seconds, run_id))
             payload = {"added_tokens": tokens, "added_seconds": seconds,
                        "previous_token_budget": row["token_budget"], "previous_time_budget": row["time_budget_seconds"],

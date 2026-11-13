@@ -21,6 +21,7 @@ from .checks import run_check
 from .codex import VALIDATED_VERSIONS, CodexError, RpcClient, codex_executable, version
 from .config import RunConfig
 from .store import ACTIVE_STATUSES, Store
+from .usage import is_provider_limit_error, next_usage_check, nonrenewable_limit, rate_limit_state, usage_read_params
 
 
 class RuntimeErrorMessage(RuntimeError):
@@ -376,6 +377,8 @@ class Runtime:
             raise RuntimeErrorMessage(
                 f"Codex version {version_text!r} is not validated; validated versions: {sorted(VALIDATED_VERSIONS)}"
             )
+        if config.auto_resume_on_usage_reset and version_text != "codex-cli 0.166.0":
+            raise RuntimeErrorMessage("automatic provider usage recovery requires validated Codex 0.166.0")
         env = os.environ.copy()
         env["CODEX_HOME"] = str(self.codex_home)
         identity = subprocess.run([self.codex, "login", "status"], capture_output=True,
@@ -436,12 +439,11 @@ class Runtime:
                 # Establish a bounded, read-only bootstrap turn before starting the
                 # worker and native TUI; both then attach to the same persisted thread
                 # before the actual objective begins.
-                bootstrap_budget = config.token_budget
                 await client.call("thread/goal/set", {
                     "threadId": thread_id,
                     "objective": "Session setup only: respond READY without using tools.",
                     "status": "paused",
-                    "tokenBudget": bootstrap_budget, "origin": "user",
+                    "tokenBudget": None, "origin": "user",
                 })
                 bootstrap = await client.call("turn/start", {
                     "threadId": thread_id,
@@ -503,12 +505,6 @@ class Runtime:
                 self.store.update_run(run_id, status="active", started_at=started_at, last_error=None)
                 self.store.add_event(run_id, "supervisor/run_started",
                                      {"thread_id": thread_id, "codex_version": version_text})
-                bootstrap_tokens = self.store.get_run(run_id)["tokens_used"]
-                remaining_token_budget = config.token_budget - bootstrap_tokens
-                if remaining_token_budget < 1:
-                    raise RuntimeErrorMessage(
-                        "session bootstrap consumed the configured token budget; increase token_budget"
-                    )
                 await self.activate(client, run_id, config, self.initial_prompt(run_id, config, run_dir))
 
             finally:
@@ -528,7 +524,8 @@ class Runtime:
                     "The overarching project continues after review; do not start a later milestone.")
         return row["objective"]
 
-    async def activate(self, client: RpcClient, run_id: str, config: RunConfig, prompt: str) -> str:
+    async def activate(self, client: RpcClient, run_id: str, config: RunConfig,
+                       prompt: str, origin: str = "user") -> str:
         row = self.store.get_run(run_id)
         if self.store.has_uncertain_work(run_id):
             raise ValueError("resolve uncertain operations before resuming")
@@ -536,24 +533,19 @@ class Runtime:
         if isinstance(goal.get("tokensUsed"), int):
             self.store.observe_token_usage(run_id, goal["tokensUsed"])
         row = self.store.get_run(run_id)
-        remaining = row["token_budget"] - row["tokens_used"]
-        if remaining <= 0 or self.store.elapsed(row) >= row["time_budget_seconds"]:
-            raise ValueError("execution budget exhausted; extend it while paused before resuming")
+        if self.store.elapsed(row) >= row["time_budget_seconds"]:
+            raise ValueError("elapsed-time budget exhausted; extend it while paused before resuming")
         objective = self.goal_objective(row)
-        native_used = goal.get("tokensUsed", 0)
         updated = await client.call("thread/goal/set", {
             "threadId": row["thread_id"], "objective": objective, "status": "paused",
-            "tokenBudget": native_used + remaining, "origin": "user",
+            "tokenBudget": None, "origin": origin,
         })
         # Counter reset semantics differ by release. Use the acknowledged native
         # baseline, never infer a reset just from an objective change.
         actual_used = (updated.get("goal") or {}).get("tokensUsed")
         if not isinstance(actual_used, int):
-            actual_used = ((await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}).get("tokensUsed", native_used)
+            actual_used = ((await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}).get("tokensUsed", goal.get("tokensUsed", 0))
         self.store.update_run(run_id, native_tokens_seen=actual_used)
-        if actual_used != native_used:
-            await client.call("thread/goal/set", {"threadId": row["thread_id"],
-                "tokenBudget": actual_used + remaining, "status": "paused", "origin": "user"})
         turn = await client.call("turn/start", {
             "threadId": row["thread_id"], "cwd": str(config.repository),
             "input": [{"type": "text", "text": prompt + "\nCurrent authorized goal:\n" + objective}],
@@ -561,7 +553,7 @@ class Runtime:
             "approvalPolicy": config.approval_policy,
             "sandboxPolicy": self._sandbox_policy(run_id, config),
         }, timeout=45)
-        await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "active", "origin": "user"})
+        await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "active", "origin": origin})
         self.store.update_run(run_id, status="active", desired_status="active", last_error=None,
                               milestone_status="active" if row["milestone_name"] else None)
         return turn.get("turn", {}).get("id") or "pending"
@@ -586,11 +578,14 @@ class Runtime:
                 raise RuntimeErrorMessage("assign the next milestone (or a revision) before resuming")
             if self.store.has_uncertain_work(run_id):
                 raise RuntimeErrorMessage("resolve uncertain operations before resuming")
-            if row["tokens_used"] >= row["token_budget"] or self.store.elapsed(row) >= row["time_budget_seconds"]:
-                raise RuntimeErrorMessage("extend the exhausted budget before resuming")
+            if self.store.elapsed(row) >= row["time_budget_seconds"]:
+                raise RuntimeErrorMessage("extend the elapsed-time budget before resuming")
         control_id = self.store.queue_control(run_id, kind, payload)
         if kind in {"pause", "stop"}:
             self.store.update_run(run_id, desired_status="paused" if kind == "pause" else "stopped")
+            waiting = self.store.usage_wait(run_id)
+            if waiting and waiting["state"] in {"waiting", "dispatching"}:
+                self.store.update_usage_wait(run_id, state="cancelled")
         elif kind == "resume":
             self.store.update_run(run_id, desired_status="active")
         elif kind in {"send", "queue"} and row["desired_status"] in {"paused", "blocked"}:
@@ -719,7 +714,7 @@ class Runtime:
                         "threadId": row["thread_id"], "turnId": active_turn["id"],
                     })
                 observed = "paused"
-            elif (total_tokens >= row["token_budget"] or self.store.elapsed(row) >= row["time_budget_seconds"] or
+            elif (self.store.elapsed(row) >= row["time_budget_seconds"] or
                   self.store.has_uncertain_work(row["id"])):
                 await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
                 if active_turn and active_turn.get("id"):
@@ -730,6 +725,9 @@ class Runtime:
                                       last_error="budget expired or operation requires resolution")
                 observed = "paused"
             elif row["desired_status"] == "active":
+                waiting = self.store.usage_wait(row["id"])
+                if row["status"] == "usage_wait" and waiting and waiting["state"] in {"waiting", "dispatching"}:
+                    return turns, native_status, "usage_wait"
                 if native_status == "paused":
                     self.store.update_run(row["id"], desired_status="paused")
                     return turns, native_status, "paused"
@@ -774,7 +772,7 @@ def config_from_snapshot(snapshot: dict[str, Any]) -> RunConfig:
         context_files=tuple(Path(x) for x in snapshot.get("context_files", [])),
         model=snapshot.get("model"), reasoning_effort=snapshot.get("reasoning_effort"),
         approval_policy=snapshot.get("approval_policy", "on-request"),
-        token_budget=snapshot["token_budget"], time_budget_seconds=snapshot["time_budget_seconds"],
+        token_budget=snapshot.get("token_budget"), time_budget_seconds=snapshot["time_budget_seconds"],
         environment_allowlist=tuple(snapshot.get("environment_allowlist", [])),
         writable_paths=tuple(Path(x) for x in snapshot.get("writable_paths", [])),
         codex_executable=snapshot.get("codex_executable"), approvals_reviewer=snapshot.get("approvals_reviewer"),
@@ -782,6 +780,7 @@ def config_from_snapshot(snapshot: dict[str, Any]) -> RunConfig:
         artifact_paths=tuple(Path(p) for p in snapshot.get("artifact_paths", [])),
         milestone=snapshot.get("milestone"),
         initial_task_file=Path(snapshot["initial_task_file"]) if snapshot.get("initial_task_file") else None,
+        auto_resume_on_usage_reset=snapshot.get("auto_resume_on_usage_reset", False),
         checks=tuple(Check(c["name"], tuple(c["command"]), Path(c["cwd"]), c["timeout_seconds"],
                            tuple(Path(x) for x in c.get("result_files", [])))
                      for c in snapshot.get("checks", [])),
@@ -834,9 +833,12 @@ def _event_summary(method: str, params: dict[str, Any]) -> tuple[dict[str, Any],
                                     delta.get("length") if isinstance(delta, dict) else
                                     delta if isinstance(delta, int) else None)
     error = params.get("error")
+    if method == "turn/completed" and isinstance(params.get("turn"), dict):
+        error = params["turn"].get("error")
     if isinstance(error, dict):
-        if "code" in error:
-            summary["error_code"] = str(error["code"])[:100]
+        code = error.get("codexErrorInfo", error.get("code"))
+        if isinstance(code, str):
+            summary["error_code"] = code[:100]
         if isinstance(error.get("message"), str):
             summary["error_message_length"] = len(error["message"])
         elif isinstance(error.get("message"), dict):
@@ -859,6 +861,149 @@ def _record_goal_limited(store: Store, run_id: str, row: Any, status: str) -> No
         return
     store.update_run(run_id, status=target, desired_status=target, last_error=error)
     store.add_event(run_id, "supervisor/goal_limited", {"goal_status": status})
+
+
+async def _enter_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
+                            config: RunConfig, turn_id: str | None,
+                            error_code: str | None = None) -> bool:
+    store = runtime.store
+    row = store.get_run(run_id)
+    if (not config.auto_resume_on_usage_reset or row["desired_status"] != "active" or
+            row["milestone_status"] == "review" or row["status"] in {"complete", "stopped"}):
+        return False
+    if store.has_uncertain_work(run_id) or store.unfinished_native_effects(run_id):
+        store.mark_native_operations_unknown(run_id)
+        store.update_run(run_id, status="blocked", desired_status="blocked",
+                         last_error="unfinished operation after usage limit; resolve before continuation")
+        return True
+    try:
+        snapshot = await client.call("account/rateLimits/read", usage_read_params(), timeout=15)
+    except (CodexError, asyncio.TimeoutError) as exc:
+        store.add_event(run_id, "supervisor/usage_read_error", {"error": str(exc)})
+        return False
+    allowed, reason, reset_at = rate_limit_state(snapshot)
+    # A generic turn failure can mean billing or authentication. Require a
+    # backend-classified temporary provider window before enabling auto-resume.
+    if reason is None or allowed is True:
+        return False
+    if not turn_id:
+        recent = await client.call("thread/resume", {"threadId": row["thread_id"],
+                                                      "cwd": row["repository"]}, timeout=20)
+        turns = recent.get("thread", {}).get("turns", [])
+        turn_id = turns[-1].get("id") if turns else None
+        if not turn_id:
+            return False
+    paused_goal = (await client.call("thread/goal/set", {"threadId": row["thread_id"],
+                                                          "status": "paused"})).get("goal") or {}
+    now = time.time()
+    store.update_run(run_id, status="usage_wait")
+    store.set_usage_wait(run_id, reason, turn_id, reset_at, next_usage_check(now, reset_at),
+                         paused_goal.get("updatedAt") if isinstance(paused_goal.get("updatedAt"), int) else None)
+    store.add_event(run_id, "supervisor/usage_wait_started", {
+        "reason": reason, "turn_id": turn_id, "reset_at": reset_at,
+        "next_check_at": next_usage_check(now, reset_at), "error_code": error_code,
+    })
+    return True
+
+
+async def _poll_usage_wait(runtime: Runtime, client: RpcClient, run_id: str,
+                           config: RunConfig) -> str | None:
+    """Check account state without a model call; return a newly active turn ID."""
+    store = runtime.store
+    row = store.get_run(run_id)
+    wait = store.usage_wait(run_id)
+    if not wait or wait["state"] not in {"waiting", "dispatching"}:
+        return None
+    if row["desired_status"] != "active" or row["milestone_status"] == "review":
+        store.update_usage_wait(run_id, state="cancelled")
+        return None
+    if store.has_uncertain_work(run_id) or store.unfinished_native_effects(run_id):
+        store.mark_native_operations_unknown(run_id)
+        store.update_usage_wait(run_id, state="blocked", last_error="uncertain operation")
+        store.update_run(run_id, status="blocked", desired_status="blocked",
+                         last_error="resolve uncertain operation before usage recovery")
+        return None
+    if time.time() < wait["next_check_at"]:
+        return None
+    try:
+        snapshot = await client.call("account/rateLimits/read", usage_read_params(), timeout=15)
+    except (CodexError, asyncio.TimeoutError) as exc:
+        checks = wait["checks"] + 1
+        store.update_usage_wait(run_id, state="waiting", checks=checks,
+                                next_check_at=next_usage_check(time.time(), None, checks),
+                                last_error=str(exc))
+        store.add_event(run_id, "supervisor/usage_read_error", {"error": str(exc)})
+        return None
+    try:
+        allowed, reason, reset_at = rate_limit_state(snapshot)
+        if nonrenewable_limit(snapshot):
+            store.update_usage_wait(run_id, state="blocked", last_error="credit or spend limit")
+            store.update_run(run_id, status="blocked", desired_status="blocked",
+                             last_error="provider credit or spend limit requires human action")
+            return None
+        if allowed is not True:
+            checks = wait["checks"] + 1
+            next_check = next_usage_check(time.time(), reset_at, checks)
+            store.update_usage_wait(run_id, state="waiting", reset_at=reset_at,
+                                    next_check_at=next_check, checks=checks,
+                                    last_error=None if reason else "ordinary usage permission unavailable")
+            store.add_event(run_id, "supervisor/usage_wait_checked", {
+                "allowed": allowed, "reason": reason, "reset_at": reset_at,
+                "next_check_at": next_check,
+            })
+            return None
+        response = await client.call("thread/resume", {"threadId": row["thread_id"],
+                                                         "cwd": row["repository"]}, timeout=20)
+        turns = response.get("thread", {}).get("turns", [])
+        goal = (await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}
+        if goal.get("status") in {"complete", "blocked", "budgetLimited"}:
+            store.update_usage_wait(run_id, state="blocked", last_error="native goal is not resumable")
+            store.update_run(run_id, status="blocked", desired_status="blocked",
+                             last_error="native goal requires review before usage recovery")
+            return None
+        if (goal.get("status") == "paused" and wait["goal_updated_at"] is not None and
+                isinstance(goal.get("updatedAt"), int) and goal["updatedAt"] > wait["goal_updated_at"]):
+            store.update_usage_wait(run_id, state="cancelled", last_error="native goal was changed after usage pause")
+            store.update_run(run_id, status="paused", desired_status="paused",
+                             last_error="native goal changed while waiting; review before resuming")
+            return None
+        active = next((t for t in reversed(turns) if t.get("status") == "inProgress"), None)
+        if active:
+            if goal.get("status") != "active":
+                store.update_usage_wait(run_id, state="waiting",
+                                        next_check_at=next_usage_check(time.time(), None, wait["checks"]))
+                return None
+            store.update_usage_wait(run_id, state="resumed", last_error=None)
+            store.update_run(run_id, status="active", last_error=None)
+            store.add_event(run_id, "supervisor/usage_resumed", {
+                "thread_id": row["thread_id"], "turn_id": active.get("id"), "source": "native"})
+            return active.get("id")
+        if not turns or not wait["turn_id"] or turns[-1].get("id") != wait["turn_id"]:
+            store.update_usage_wait(run_id, state="blocked", last_error="thread advanced while waiting")
+            store.update_run(run_id, status="blocked", desired_status="blocked",
+                             last_error="native thread advanced while waiting; inspect before continuation")
+            return None
+        if store.elapsed(row) >= row["time_budget_seconds"]:
+            store.update_usage_wait(run_id, state="blocked", last_error="elapsed-time budget exhausted")
+            store.update_run(run_id, status="paused", desired_status="paused",
+                             last_error="elapsed-time budget exhausted during usage wait")
+            return None
+        store.update_usage_wait(run_id, state="dispatching")
+        turn_id = await runtime.activate(client, run_id, config,
+            "Provider usage is available again. Continue the existing objective from saved state. "
+            "Inspect completed actions and artifacts before retrying any operation.",
+            origin="automatic")
+        store.update_usage_wait(run_id, state="resumed", last_error=None)
+        store.add_event(run_id, "supervisor/usage_resumed", {
+            "thread_id": row["thread_id"], "turn_id": turn_id, "source": "supervisor"})
+        return turn_id
+    except (CodexError, asyncio.TimeoutError) as exc:
+        # An acknowledgement can be lost after turn/start. Never blindly send a
+        # second model turn; reconciliation after restart inspects native turns.
+        store.update_usage_wait(run_id, state="dispatching", last_error=str(exc),
+                                next_check_at=time.time() + 300)
+        store.add_event(run_id, "supervisor/usage_resume_uncertain", {"error": str(exc)})
+        return None
 
 
 async def run_worker(root: Path, run_id: str) -> None:
@@ -1003,6 +1148,12 @@ async def run_worker(root: Path, run_id: str) -> None:
                     runtime.tmux("kill-session", "-t", row["tmux_session"], check=False)
                     return
 
+                if row["status"] == "usage_wait":
+                    resumed_turn = await _poll_usage_wait(runtime, client, run_id, config)
+                    if resumed_turn:
+                        active_turn = resumed_turn
+                    row = store.get_run(run_id)
+
                 now = time.time()
                 if store.elapsed(row) >= row["time_budget_seconds"] and row["status"] == "active":
                     await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
@@ -1038,21 +1189,9 @@ async def run_worker(root: Path, run_id: str) -> None:
                                 store.add_event(run_id, "supervisor/token_usage", {
                                     "native_tokens_used": goal["tokensUsed"],
                                     "supervisor_tokens_used": total_tokens,
-                                    "token_budget": row["token_budget"],
+                                    "token_warning_threshold": row["token_budget"] or None,
                                 })
-                            if total_tokens >= row["token_budget"] and row["status"] == "active":
-                                await client.call("thread/goal/set", {
-                                    "threadId": row["thread_id"], "status": "paused",
-                                })
-                                if active_turn and active_turn != "pending":
-                                    await client.call("turn/interrupt", {
-                                        "threadId": row["thread_id"], "turnId": active_turn,
-                                    })
-                                store.update_run(run_id, status="paused", desired_status="paused",
-                                                 last_error="supervisor token budget reached")
-                                store.add_event(run_id, "supervisor/token_budget_reached", {
-                                    "tokens_used": total_tokens, "token_budget": row["token_budget"],
-                                })
+                            store.warn_token_usage(run_id)
                         if status == "paused" and row["status"] == "active" and not active_turn:
                             store.update_run(run_id, status="paused", desired_status="paused",
                                              last_error="native goal paused; inspect progress before resuming")
@@ -1101,8 +1240,10 @@ async def run_worker(root: Path, run_id: str) -> None:
                                     store.add_event(run_id, "supervisor/goal_completed", {"checks": outcomes})
                                     if final_status in {"complete", "validation_failed"}:
                                         return
-                        elif status in {"usageLimited", "budgetLimited", "blocked"} and row["status"] not in {"complete", "stopped"}:
-                            _record_goal_limited(store, run_id, row, status)
+                        elif status in {"usageLimited", "budgetLimited", "blocked"} and row["status"] not in {"complete", "stopped", "usage_wait"}:
+                            if status != "usageLimited" or not await _enter_usage_wait(
+                                    runtime, client, run_id, config, active_turn):
+                                _record_goal_limited(store, run_id, row, status)
                     except CodexError as exc:
                         store.add_event(run_id, "supervisor/goal_status_error", {"error": str(exc)})
 
@@ -1132,9 +1273,13 @@ async def run_worker(root: Path, run_id: str) -> None:
                     if was_active:
                         active_turn = None
                     if was_active and params.get("status") == "failed":
-                        await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
-                        store.update_run(run_id, status="paused", desired_status="paused",
-                                         last_error="Codex turn failed; inspect the native TUI before resuming")
+                        recovered = (is_provider_limit_error(params.get("error_code")) and
+                                     await _enter_usage_wait(runtime, client, run_id, config,
+                                                             params.get("turn_id"), params.get("error_code")))
+                        if not recovered:
+                            await client.call("thread/goal/set", {"threadId": row["thread_id"], "status": "paused"})
+                            store.update_run(run_id, status="paused", desired_status="paused",
+                                             last_error="Codex turn failed; inspect the native TUI before resuming")
                         store.add_event(run_id, "supervisor/turn_failed", params)
                     try:
                         checkpoint = await asyncio.to_thread(git_checkpoint, config.repository)

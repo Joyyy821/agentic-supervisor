@@ -36,7 +36,7 @@ class RunConfig:
     model: str | None
     reasoning_effort: str | None
     approval_policy: str
-    token_budget: int
+    token_budget: int | None
     time_budget_seconds: int
     environment_allowlist: tuple[str, ...]
     writable_paths: tuple[Path, ...]
@@ -47,6 +47,7 @@ class RunConfig:
     artifact_paths: tuple[Path, ...] = ()
     milestone: dict[str, str] | None = None
     initial_task_file: Path | None = None
+    auto_resume_on_usage_reset: bool = False
 
     def safe_snapshot(self) -> dict[str, Any]:
         return {
@@ -66,6 +67,8 @@ class RunConfig:
             "reasoning_effort": self.reasoning_effort,
             "approval_policy": self.approval_policy,
             "token_budget": self.token_budget,
+            "token_budget_mode": "advisory",
+            "auto_resume_on_usage_reset": self.auto_resume_on_usage_reset,
             "time_budget_seconds": self.time_budget_seconds,
             "environment_allowlist": list(self.environment_allowlist),
             "writable_paths": [str(p) for p in self.writable_paths],
@@ -273,6 +276,16 @@ def load_config(path: str | Path, runtime_override: str | Path | None = None) ->
         results = tuple(results)
         checks.append(Check(name, tuple(command), cwd, timeout, results))
 
+    token_warning = data.get("token_warning_threshold", data.get("token_budget"))
+    if "token_warning_threshold" in data and "token_budget" in data:
+        raise ConfigError("specify token_warning_threshold or legacy token_budget, not both")
+    if token_warning is not None and (isinstance(token_warning, bool) or
+            not isinstance(token_warning, int) or not 1 <= token_warning <= 10000000):
+        raise ConfigError("token_warning_threshold must be null or an integer between 1 and 10000000")
+    auto_resume = data.get("auto_resume_on_usage_reset", False)
+    if not isinstance(auto_resume, bool):
+        raise ConfigError("auto_resume_on_usage_reset must be a boolean")
+
     return RunConfig(
         source=source,
         version=1,
@@ -284,13 +297,14 @@ def load_config(path: str | Path, runtime_override: str | Path | None = None) ->
         model=model,
         reasoning_effort=reasoning,
         approval_policy=approval_policy,
-        token_budget=_positive_int(data, "token_budget", 100000, 10000000),
+        token_budget=token_warning,
         time_budget_seconds=_positive_int(data, "time_budget_seconds", 7200, 604800),
         environment_allowlist=tuple(env_names),
         writable_paths=writable_paths,
         checks=tuple(checks),
         codex_executable=executable, approvals_reviewer=reviewer, sandbox_mode=sandbox,
         artifact_paths=tuple(artifacts), milestone=milestone, initial_task_file=task_file,
+        auto_resume_on_usage_reset=auto_resume,
     )
 
 
