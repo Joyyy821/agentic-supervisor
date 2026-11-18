@@ -66,6 +66,9 @@ def parser() -> argparse.ArgumentParser:
     milestone.add_argument("run_id")
     milestone.add_argument("name")
     milestone.add_argument("--objective", required=True)
+    reconcile = commands.add_parser("reconcile", help="record an idle native session's late checkpoint, paused for review")
+    reconcile.add_argument("run_id")
+    reconcile.add_argument("--checkpoint", type=Path, required=True)
     resolve = commands.add_parser("resolve")
     resolve.add_argument("run_id")
     resolve.add_argument("target_id")
@@ -139,6 +142,7 @@ def _print_status(runtime: Runtime, run_id: str) -> None:
     checkpoint = runtime.store.latest_event(run_id, "supervisor/git_checkpoint")
     usage_wait = runtime.store.usage_wait(run_id)
     config = json.loads(row["config_json"])
+    workflow = runtime.store.latest_event(run_id, "supervisor/checkpoint_reconciled")
     print(json.dumps({
         "id": row["id"], "project": row["project"], "repository": row["repository"],
         "thread_id": row["thread_id"], "status": row["status"],
@@ -160,6 +164,7 @@ def _print_status(runtime: Runtime, run_id: str) -> None:
                       "status": row["milestone_status"], "tokens_used": row["tokens_used"] - row["stage_token_start"],
                       "elapsed_seconds": runtime.store.elapsed(row) - row["stage_time_start"]} if row["milestone_name"] else None,
         "latest_checkpoint": json.loads(checkpoint["payload_json"]) if checkpoint else None,
+        "workflow_checkpoint": json.loads(workflow["payload_json"]) if workflow else None,
         "attempts": [{"id": a["id"], "name": a["name"], "status": a["status"],
                        "exit_code": a["exit_code"]} for a in attempts],
         "controls": [{"id": c["id"], "kind": c["kind"], "status": c["status"],
@@ -245,6 +250,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "milestone":
         runtime.store.set_milestone(args.run_id, args.name, args.objective)
+        _print_status(runtime, args.run_id)
+        return 0
+    if args.command == "reconcile":
+        runtime.reconcile_checkpoint(args.run_id, args.checkpoint)
         _print_status(runtime, args.run_id)
         return 0
     if args.command == "send":

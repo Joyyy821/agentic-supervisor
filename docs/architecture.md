@@ -29,3 +29,10 @@ Sandbox, approval policy, reviewer, model and reasoning effort are configurable.
 Checks use argument arrays, native sandboxed `command/exec`, finite timeouts and attempt records written before dispatch. Git checkpoints record HEAD, changed paths and a streamed tracked-diff hash; they do not automatically commit application code. Project workflows remain responsible for durable source commits and experiment records.
 
 Worker recovery reconciles the same thread. Server recovery also marks observed unfinished command/file/tool effects uncertain. Resolving a ledger record requires evidence and does not retry it. Native event IDs deduplicate canonical events; transient output gaps are reported. Arbitrary external process completion and exactly-once effects cannot be reconstructed from a resumed conversation alone.
+
+When native work outlives a worker, an operator can reconcile a late checkpoint
+with hashed report evidence after backing up metadata and confirming idle native
+state. Real worker and lifecycle locks exclude supervisor dispatch during this
+operation; the recorded result is always paused for review. It preserves existing
+usage and marks the historical accounting gap rather than inventing per-stage
+totals. It does not mutate the native goal or grant execution authority.

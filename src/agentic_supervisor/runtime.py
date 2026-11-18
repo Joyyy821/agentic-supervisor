@@ -675,6 +675,58 @@ class Runtime:
             asyncio.run(self._check_policy_native(row))
             self.store.migrate_policy(run_id, unbound_tokens, auto_resume)
 
+    def reconcile_checkpoint(self, run_id: str, path: Path) -> None:
+        """Confirm idle native state before recording a late human review checkpoint."""
+        from .reconciliation import load_checkpoint
+        checkpoint = load_checkpoint(path.resolve())
+        # Use the real worker lock: a dead tmux pane alone cannot rule out a
+        # worker started outside tmux. Neither lock grants execution authority.
+        fd = acquire_worker_lock(self.root)
+        try:
+            with lifecycle_lock(self.root):
+                row = self.store.get_run(run_id)
+                if row["status"] not in {"recovering", "blocked", "paused"} or row["desired_status"] != "paused":
+                    raise RuntimeErrorMessage("checkpoint reconciliation requires persisted pause intent")
+                if row["codex_version"] != "codex-cli 0.166.0":
+                    raise RuntimeErrorMessage("checkpoint reconciliation is validated only for Codex 0.166.0")
+                self.tmux("has-session", "-t", row["tmux_session"])
+                worker = self.tmux("list-panes", "-t", f"{row['tmux_session']}:supervisor",
+                                   "-F", "#{pane_dead}", check=False)
+                if worker.returncode == 0 and worker.stdout.strip() != "1":
+                    raise RuntimeErrorMessage("owned worker must be stopped before checkpoint reconciliation")
+                self.codex = codex_executable(row["codex_executable"] or self.codex)
+                if asyncio.run(version(self.codex)) != row["codex_version"]:
+                    raise RuntimeErrorMessage("recorded Codex executable changed version")
+                native = asyncio.run(self._inspect_checkpoint_native(row))
+                self.store.reconcile_checkpoint(run_id, checkpoint, native)
+        finally:
+            os.close(fd)
+
+    async def _inspect_checkpoint_native(self, row: Any) -> dict[str, Any]:
+        client = await self.connect_when_ready(self.app_socket(row["id"]), 10)
+        try:
+            response = await client.call("thread/read", {"threadId": row["thread_id"], "includeTurns": False})
+            thread = response.get("thread") or {}
+            goal = (await client.call("thread/goal/get", {"threadId": row["thread_id"]})).get("goal") or {}
+            page = await client.call("thread/turns/list", {
+                "threadId": row["thread_id"], "limit": 5, "sortDirection": "desc", "itemsView": "notLoaded"})
+            status = thread.get("status") or {}
+            turns = page.get("data", [])
+            if (thread.get("id") != row["thread_id"] or thread.get("cwd") != row["repository"] or
+                    status.get("type") != "idle" or status.get("activeFlags") or
+                    goal.get("threadId") != row["thread_id"] or goal.get("status") not in {"paused", "complete"} or
+                    any(t.get("status") not in {"completed", "failed", "interrupted"} for t in turns)):
+                raise RuntimeErrorMessage("native thread must be idle in the recorded repository, with a paused/completed goal and no pending turn")
+            pending_request = False
+            while not client.notifications.empty():
+                pending_request |= "id" in client.notifications.get_nowait()
+            if client.dropped_notifications or pending_request:
+                raise RuntimeErrorMessage("native pending request or event gap requires inspection")
+            return {"thread_id": thread["id"], "status": status, "goal": goal,
+                    "turns": [{k: t.get(k) for k in ("id", "status", "completedAt")} for t in turns]}
+        finally:
+            await client.close()
+
     async def _check_policy_native(self, row: Any) -> None:
         client = await self.connect_when_ready(self.app_socket(row["id"]), 10)
         try:

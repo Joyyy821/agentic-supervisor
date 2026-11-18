@@ -100,6 +100,10 @@ agentic-supervisor stop RUN_ID
 
 Resolve uncertain outcomes with evidence after the supervisor has marked them `outcome_unknown`. For example, use `agentic-supervisor resolve RUN_ID ATTEMPT_ID --type attempt --outcome succeeded --evidence "verified result file and exit record"` for a command, or `agentic-supervisor resolve RUN_ID CONTROL_ID --type control --outcome not_applied --evidence "confirmed no request reached Codex"` for a control. Resolution updates the ledger only; it does not retry the operation.
 
+If native work progressed while the worker was absent, use the evidence-based
+[`reconcile` maintenance procedure](docs/operations.md#reconciling-native-work-performed-outside-the-worker)
+to record the checkpoint paused for review before migrating policy or recovering.
+
 ## Configuration and checks
 
 Repository/runtime/executable/task/artifact paths are relative to the JSON file; context files, check working directories and relative check results are relative to the target repository. See the example for optional model, reasoning effort, environment-variable allowlist, writable artifact paths, and named validation commands. Checks use argument arrays, run through Codex's sandboxed command interface, and record their exit status and declared result files. Core code treats result JSON as opaque and makes no domain-specific assumptions.

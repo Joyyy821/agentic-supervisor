@@ -55,11 +55,12 @@ finished and the TUI has no approval or user-input request. Resolve uncertain
 controls/attempts first. Do not apply these steps to an active agent merely to
 install this version.
 
-For the previously recorded Agentic MAPF runtime, the procedure is shown
-below. The last read-only supervisor ledger inspected during this review still
-reported this run at M1a/review; do not assume it is the session running M2a.
-Confirm the intended runtime and thread with the operator before applying the
-commands to any run.
+For the Agentic MAPF runtime, the procedure is shown below. Its historical
+M1a/worker inconsistency was reconciled during [controlled maintenance on
+2026-11-18](applications/amapf-maintenance-20261118.md); policy is already
+migrated and the run is paused at M2b review. This is a procedure reference,
+not an instruction to repeat maintenance. Confirm current runtime/thread and
+ownership before applying these commands to any run.
 
 ```sh
 cd /home/yangjiao/workspace/agentic-supervisor
@@ -95,6 +96,60 @@ Do not restart an older worker on the migrated run: old supervisor code ignores
 the new mode and can reapply a token cap. `policy RUN --auto-resume off`
 disables automatic recovery using the same paused/idle/worker-stopped checks.
 The existing active-time limit, sandbox and approval policies do not change.
+
+## Reconciling native work performed outside the worker
+
+If the native thread progressed while the worker was absent, its ledger may
+still describe an earlier review. Back up SQLite with its backup API (including
+committed WAL contents), native goal/thread metadata and rollout history first;
+keep backups private and exclude credentials. Confirm no experiment, background
+command, approval, user-input request or uncertain operation remains. A missing
+`lifecycle.lock` alone does not establish a failed lock or permit dispatch: normal
+supervisor lifecycle commands create and acquire the actual serialization lock.
+Do not create a substitute file to satisfy a downstream gate.
+
+With the owned worker stopped, provide a versioned checkpoint manifest:
+
+```json
+{
+  "version": 1,
+  "milestone": {"name": "implementation", "objective": "Review the implementation and remaining validation gates."},
+  "completed_milestones": [{"name": "audit", "evidence": ["/path/to/audit-report.md"]}],
+  "evidence": ["/path/to/implementation-report.md"],
+  "retire_checks": true
+}
+```
+
+```sh
+agentic-supervisor reconcile RUN_ID --checkpoint /path/to/checkpoint.json
+agentic-supervisor policy RUN_ID --unbound-tokens --auto-resume on
+agentic-supervisor recover RUN_ID
+agentic-supervisor status RUN_ID
+```
+
+`reconcile` requires persisted pause intent, an inactive ledger, a stopped worker
+pane and an available worker lock. It reads the existing 0.166.0 native thread
+without resuming it; the repository must match, the thread must be idle and its
+goal paused/completed. It refuses pending requests, active turns and unresolved
+side effects. External experiment inactivity remains an operator precondition.
+The command records evidence hashes and late milestone history transactionally,
+increments the generation once, and leaves `paused`/`review`. Repeating identical
+evidence is idempotent. It never dispatches a command, changes native goals or
+claims historical validation it did not execute. `retire_checks: true` explicitly
+archives obsolete checks in the event and clears them from the effective config;
+otherwise they remain. Inspect `status.workflow_checkpoint` and events for the
+prior state, evidence and native snapshot. Original run/config/history files and
+cumulative counters are preserved. Later unsupervised usage and elapsed time
+cannot be assigned retroactively to stages; the new baseline starts now.
+
+Recovery restores a monitoring worker without authorizing execution. The native
+paused historical goal (including its old cap) is retained until the next
+authorized resume, which applies the current milestone and removes the cap.
+Auto-resume remains ineligible during manual pause or milestone review. The
+creation-time writable roots, approvals and elapsed-time limit remain unchanged;
+review their suitability before authorizing another task. Do not copy a stale
+database backup over a live App Server; rollback requires another maintenance
+window and native/ledger reconciliation.
 
 ## Approvals and sandbox
 

@@ -455,6 +455,45 @@ class Store:
                     "token_warning_threshold": row["token_budget"] or None,
                     "thread_id": row["thread_id"], "tokens_used": row["tokens_used"]}), time.time()))
 
+    def reconcile_checkpoint(self, run_id: str, checkpoint: dict[str, Any], native: dict[str, Any]) -> None:
+        """Record late evidence, never fabricate historical usage or authorize work."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if (row is None or row["status"] not in {"recovering", "blocked", "paused"} or
+                    row["desired_status"] != "paused" or row["active_since"] is not None):
+                raise ValueError("checkpoint reconciliation requires persisted pause intent and an inactive ledger")
+            if db.execute("SELECT 1 FROM controls WHERE run_id=? AND "
+                          "(status IN ('dispatched','awaiting_ack','outcome_unknown') OR "
+                          "(status='queued' AND kind NOT IN ('send','queue'))) ", (run_id,)).fetchone() or db.execute(
+                    "SELECT 1 FROM attempts WHERE run_id=? AND status IN ('running','outcome_unknown')",
+                    (run_id,)).fetchone() or self.unfinished_native_effects(run_id):
+                raise ValueError("resolve pending or unfinished operations before checkpoint reconciliation")
+            if native["thread_id"] != row["thread_id"]:
+                raise ValueError("native thread identity changed")
+            key = "checkpoint:" + checkpoint["id"]
+            if db.execute("SELECT 1 FROM events WHERE run_id=? AND native_id=? AND "
+                          "kind='supervisor/checkpoint_reconciled'", (run_id, key)).fetchone():
+                return
+            previous = {key: row[key] for key in ("status", "desired_status", "milestone_name",
+                        "milestone_objective", "milestone_status", "milestone_generation",
+                        "stage_token_start", "stage_time_start", "tokens_used", "elapsed_seconds", "last_error")}
+            config = json.loads(row["config_json"])
+            retired = config.get("checks", []) if checkpoint["retire_checks"] else []
+            if checkpoint["retire_checks"]:
+                config["checks"] = []
+            config["milestone"] = checkpoint["milestone"]
+            db.execute("UPDATE runs SET status='paused',desired_status='paused',milestone_name=?,"
+                       "milestone_objective=?,milestone_status='review',milestone_generation=milestone_generation+1,"
+                       "stage_token_start=tokens_used,stage_time_start=elapsed_seconds,config_json=?,last_error=NULL WHERE id=?",
+                       (checkpoint["milestone"]["name"], checkpoint["milestone"]["objective"],
+                        json.dumps(config, sort_keys=True), run_id))
+            db.execute("INSERT INTO events(run_id,native_id,kind,payload_json,created_at) VALUES(?,?,?,?,?)", (
+                run_id, key, "supervisor/checkpoint_reconciled", json.dumps({"previous": previous,
+                    "checkpoint": checkpoint, "native": native, "retired_checks": retired,
+                    "recorded_late": True, "usage_gap": "Unsupervised native turns are not retroactively attributed to stages."}),
+                time.time()))
+
     def set_milestone(self, run_id: str, name: str, objective: str) -> None:
         from .config import validate_milestone
         milestone = validate_milestone({"name": name, "objective": objective})
